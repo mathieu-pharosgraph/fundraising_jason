@@ -474,7 +474,13 @@ def main():
             results_df[c] = pd.to_numeric(results_df.get(c, np.nan), errors="coerce").clip(0,100)
 
         # ---- label_key for stable merges
-        results_df["label_key"] = results_df["story_label"].str.lower().str.replace(r"[^a-z0-9]+","", "", regex=True)
+        results_df["label_key"] = (
+            results_df["story_label"]
+            .astype(str)
+            .str.lower()
+            .str.replace(r"[^a-z0-9]+", "", regex=True)
+            .str.strip()
+        )
         results_df["period"] = results_df["period"].astype(str)
         results_df["cluster_id"] = pd.to_numeric(results_df["cluster_id"], errors="coerce").astype("Int64")
         # ---- write an enriched parquet for downstream merges
