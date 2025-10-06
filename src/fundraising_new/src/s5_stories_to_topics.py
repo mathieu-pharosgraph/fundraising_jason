@@ -95,7 +95,7 @@ def get_hash(input_string):
     return hashlib.sha256(input_string.strip().encode('utf-8')).hexdigest()
 
 # 2. Configure the DeepSeek API Classifier
-API_KEY = "sk-2893e99d295945b292efbc7dcba825d5"  # Replace with your actual key
+API_KEY = #modify to load the key via secret.env  # Replace with your actual key
 API_URL = "https://api.deepseek.com/v1/chat/completions"  # Verify the correct endpoint
 
 # Our expertly crafted system prompt
