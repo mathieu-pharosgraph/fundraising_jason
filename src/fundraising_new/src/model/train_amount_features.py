@@ -153,6 +153,8 @@ def _clean_feature_series(key: str, s: pd.Series) -> pd.Series:
             return s.clip(200, 5_000)
         if key == "median_home_value":
             return s.clip(10_000, 5_000_000)
+        if key.startswith("emp_share_"):
+            return s.clip(0, 1)
 
     # per-1k counts → trim fat tails
     if key in {"ntee_public_affairs_per_1k","ntee_total_per_1k"}:
