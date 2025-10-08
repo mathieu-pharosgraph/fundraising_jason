@@ -134,40 +134,36 @@ def best_alias(df_cols, key):
     return None
 
 def _clean_feature_series(key: str, s: pd.Series) -> pd.Series:
-    """Sanitize units/sentinels/ranges before aggregation."""
     s = pd.to_numeric(s, errors="coerce")
 
-    # % / share variables → clamp to 0..100
-    pct_like = {"educ","internet_home","rent_as_income_pct",
-                "pct_bachelors_plus","pct_bachelor_plus","pct_broadband","pct_snap"}
+    # percents
+    pct_like = {"educ","internet_home","rent_as_income_pct","pct_bachelors_plus","pct_bachelor_plus","pct_broadband","pct_snap"}
     if key in pct_like or key.startswith("pct_"):
         return s.clip(0, 100)
 
-    # money-ish variables in dollars → clamp to reasonable range
+    # money-ish
     if key in {"income","median_hh_income","median_income","B19013_001E",
                "median_gross_rent","median_home_value"}:
-        s = s.mask(s <= 0, np.nan)                    # drop non-positive sentinels (e.g., -666666666)
-        if key in {"median_hh_income","median_income","income","B19013_001E"}:
-            return s.clip(5_000, 300_000)
-        if key == "median_gross_rent":
-            return s.clip(200, 5_000)
-        if key == "median_home_value":
-            return s.clip(10_000, 5_000_000)
-        if key.startswith("emp_share_"):
-            return s.clip(0, 1)
+        s = s.mask(s <= 0, np.nan)
+        if key in {"median_hh_income","median_income","income","B19013_001E"}: return s.clip(5_000, 300_000)
+        if key == "median_gross_rent": return s.clip(200, 5_000)
+        if key == "median_home_value": return s.clip(10_000, 5_000_000)
 
-    # per-1k counts → trim fat tails
+    # industries (always clamp 0..1)
+    if key.startswith("emp_share_"):
+        return s.clip(0, 1)
+
+    # per-1k
     if key in {"ntee_public_affairs_per_1k","ntee_total_per_1k"}:
         return s.clip(0, 300)
 
-    # ownership rate / home_owner (if present as 0..1) → project to 0..100
+    # ownership rate
     if key in {"home_owner","owner_occ_rate"}:
-        if s.quantile(0.95) <= 1.5:  # looks like 0..1
-            s = s * 100.0
+        if s.quantile(0.95) <= 1.5: s = s * 100.0
         return s.clip(0, 100)
 
-    # default passthrough
     return s
+
 
 
 def align_feature_matrix(cbg, basis_keys):
@@ -398,14 +394,20 @@ def main():
         e_size = e_size / s
 
     # Keep at least K strongest features non-zero (prevents collapse to 1-2 variables)
-    K = 8  # adjust to 6–12 depending on breadth you want
-    order = e_size.abs().sort_values(ascending=False)
-    keep = order.index[:K]
+    families = {
+        "industry": [k for k in e_size.index if k.startswith("emp_share_")],
+        "socio":    [k for k in e_size.index if k in {"educ","income","internet_home",
+                                                    "median_gross_rent","median_home_value",
+                                                    "rent_as_income_pct","ntee_public_affairs_per_1k",
+                                                    "owner_occ_rate","poverty_rate"}],
+    }
+    K_ind, K_soc = 4, 4
+    keep_ind = (e_size.loc[families["industry"]].abs().sort_values(ascending=False).index[:K_ind])
+    keep_soc = (e_size.loc[families["socio"]].abs().sort_values(ascending=False).index[:K_soc])
+    keep = set(keep_ind) | set(keep_soc)
     e_size.loc[~e_size.index.isin(keep)] = 0.0
-    # Re-normalize to L1 = 1 (if any mass)
     s2 = e_size.abs().sum()
-    if s2 > 0:
-        e_size = e_size / s2
+    if s2 > 0: e_size = e_size / s2
         
     # DEBUG: write top blended weights
     (
