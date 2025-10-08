@@ -870,6 +870,17 @@ try:
 except Exception:
     period_dt = None
 
+track_map = {
+    "Party — Dem": ("Dem", "best_per_cbg_Dem.parquet"),
+    "Party — GOP": ("GOP", "best_per_cbg_GOP.parquet"),
+    "Overall Donate (Any)": (None, "best_per_cbg_Any.parquet"),
+    "Type — Candidate": (None, "best_per_cbg_Candidate.parquet"),
+    "Type — Org": (None, "best_per_cbg_Org.parquet"),
+    "Donation Size": (None, "best_per_cbg_Size.parquet"),
+}
+track_label = st.selectbox("Track", list(track_map.keys()), index=0)
+party_for_track, winners_file = track_map[track_label]
+
 # after period is selected
 states_avail = sorted(feat_small["state"].dropna().astype(str).str.upper().unique().tolist()) \
                if "state" in feat_small.columns else []
@@ -1441,7 +1452,7 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Story Leaderboard (CBGs where story is best)")
     if USE_PRECOMPUTED_ONLY:
-        path = BEST_PRE[party]
+        path = COMPACT_DIR / winners_file
         if not path.exists():
             st.warning("Precomputed best-per-CBG not found. Run s7g_precompute_artifacts.py.")
             st.stop()
@@ -1481,7 +1492,7 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("Best Story by CBG (map)")
 
-    path = BEST_PRE[party]
+    path = COMPACT_DIR / winners_file
     if not path.exists():
         st.warning("Precomputed best-per-CBG not found. Run s7h_precompute_artifacts.py.")
         st.stop()
@@ -1629,9 +1640,74 @@ with tabs[5]:
     else:
         demo_col = st.selectbox("Subgroup column", avail_subgroups, index=0)
 
+        # which feature-dot column to weight on
+        TRACK_TO_COL = {
+            "Party — Dem": "final_affinity_cbg_dem",   # falls back to affinity_cbg_dem if 'final_' missing
+            "Party — GOP": "final_affinity_cbg_gop",
+            "Overall Donate (Any)": "affinity_cbg_any",
+            "Type — Candidate": "affinity_cbg_cand",
+            "Type — Org": "affinity_cbg_org",
+            "Donation Size": "affinity_cbg_size",
+        }
+        aff_col = TRACK_TO_COL[track_label]
+
+        import pyarrow.dataset as ds
+
+        def subgroup_ranks_fd(period: str, aff_col: str, demo_col: str,
+                            feat_small: pd.DataFrame, topics_map: pd.DataFrame):
+            # weights by subgroup share × adults (if present)
+            if demo_col not in feat_small.columns:
+                return pd.DataFrame(), pd.DataFrame()
+            w = normalize_share_like(feat_small[demo_col])
+            if "adults" in feat_small.columns:
+                w = w * pd.to_numeric(feat_small["adults"], errors="coerce").fillna(0.0)
+            weights = feat_small[["cbg_id"]].copy()
+            weights["cbg_id"] = weights["cbg_id"].astype(str)
+            weights["__w"] = w.fillna(0.0)
+
+            # read feature-dot for the period
+            fd = ds.dataset(FEATUREDOT_PATH, format="parquet")
+            cols = fd.schema.names
+            use_col = aff_col if aff_col in cols else \
+                    ("affinity_cbg_dem" if aff_col.endswith("_dem") else
+                    "affinity_cbg_gop" if aff_col.endswith("_gop") else aff_col)
+            tbl = fd.to_table(columns=["period","label","cbg_id",use_col], filter=(ds.field("period")==str(period)))
+            df = tbl.to_pandas()
+            if df.empty:
+                return pd.DataFrame(), pd.DataFrame()
+            df["cbg_id"] = df["cbg_id"].astype(str)
+            df = df.rename(columns={use_col:"aff_val"})
+            df["label_key"] = df["label"].astype(str).apply(_norm_key)
+
+            d = df.merge(weights, on="cbg_id", how="left")
+            vals = pd.to_numeric(d["aff_val"], errors="coerce").fillna(0.0)
+            d["__wt"] = vals * d["__w"]
+
+            # Story ranks
+            story_scores = (
+                d.groupby(["period","label"], as_index=False)["__wt"]
+                .sum().rename(columns={"__wt":"subgroup_score"})
+                .sort_values("subgroup_score", ascending=False)
+            )
+
+            # Topic ranks (if mapping exists)
+            if topics_map.empty:
+                topic_scores = pd.DataFrame(columns=["period","std_topic","subgroup_score"])
+            else:
+                d2 = d.merge(topics_map, on="label_key", how="left")
+                d2 = _explode_and_fill_std_topics(d2)
+                d2["__wt"] = pd.to_numeric(d2["__wt"], errors="coerce").fillna(0.0)
+                topic_scores = (
+                    d2.groupby(["period","std_topic"], as_index=False)["__wt"]
+                    .sum().rename(columns={"__wt":"subgroup_score"})
+                    .sort_values("subgroup_score", ascending=False)
+                )
+            return story_scores, topic_scores
+
         # Compute weighted ranks (uses normalized label_key mapping inside)
         with st.spinner("Computing subgroup rankings…"):
-            stories, topics = subgroup_ranks(period_str, party, demo_col, feat_small, enriched)
+            stories, topics = subgroup_ranks_fd(period_str, aff_col, demo_col, feat_small, enriched)
+
             st.caption(f"DEBUG[subgroup]: stories={len(stories)}, topics={len(topics)}")
             resolved = stories["period"].iloc[0] if not stories.empty else (topics["period"].iloc[0] if not topics.empty else period_str)
             st.caption(f"Subgroup rankings computed for period: **{resolved}**")
