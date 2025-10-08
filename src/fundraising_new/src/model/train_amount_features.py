@@ -131,7 +131,19 @@ def align_feature_matrix(cbg, basis_keys):
         return pd.DataFrame({"zip5": cbg["zip5"].values}).drop_duplicates(), []
 
     out = pd.DataFrame(cols)
-    Z = out.groupby("zip5").mean(numeric_only=True).reset_index()
+    # aggregate to ZIP (weighted mean by adults_18plus if present)
+    if "adults_18plus" in cbg.columns:
+        w = pd.to_numeric(cbg["adults_18plus"], errors="coerce").fillna(0.0)
+        out["__w"] = w.values
+        Z = (out.groupby("zip5")
+                .apply(lambda g: pd.Series({
+                    **{k: pd.to_numeric(g[k], errors="coerce").mul(g["__w"]).sum() / (g["__w"].sum() or 1.0)
+                    for k in g.columns if k not in ("zip5","__w")}
+                }))
+                .reset_index())
+    else:
+        Z = out.groupby("zip5").mean(numeric_only=True).reset_index()
+
 
     # drop columns that are all-NaN or constant
     good = []
@@ -152,7 +164,7 @@ def main():
     ap.add_argument("--basis-in", required=True, help="Existing feature basis parquet")
     ap.add_argument("--outdir", required=True, help="Directory for model artifacts")
     ap.add_argument("--basis-out", default=None, help="Output basis parquet (default = --basis-in)")
-    ap.add_argument("--alphas", default="0.1,0.3,1,3,10", help="Comma-separated Ridge alphas")
+    ap.add_argument("--alphas", default="0.03,0.1,0.3,1,3", help="Comma-separated Ridge alphas")
     args = ap.parse_args()
 
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
@@ -169,13 +181,24 @@ def main():
     # 3) Build ZIP-level feature matrix aligned to basis
     Z, used_keys = align_feature_matrix(cbg, basis_keys)  # Z: zip5 + mapped features
     if not used_keys:
-        # Fallback to a sensible default set commonly present in CBG features
+        # Fallback to a broader, interpretable set commonly present in CBG features
         fallback_keys = [
-            "pct_bachelor_plus", "median_hh_income", "urban_q", "pct_broadband",
-            "poverty_rate", "owner_occ_rate", "rent_as_income_pct",
-            "share_dem", "share_gop", "ntee_public_affairs_per_1k",
-            "emp_share_manufacturing", "emp_share_healthcare_social",
+            # Socio-economic / demos
+            "pct_bachelors_plus","median_hh_income","median_age","household_size_avg",
+            "pct_snap","pct_broadband","poverty_rate","owner_occ_rate","median_gross_rent",
+            "median_home_value","rent_as_income_pct",
+
+            # Party mix (optional, if you keep them)
+            "share_dem","share_gop",
+
+            # Civic / nonprofit / platform
+            "ntee_public_affairs_per_1k","ntee_total_per_1k",
+
+            # Employment structure (examples — include the ones you have)
+            "emp_share_manufacturing","emp_share_retail","emp_share_healthcare_social",
+            "emp_share_professional_scientific_mgmt","emp_share_information",
         ]
+
         Z_fallback, used_fallback = align_feature_matrix(cbg, fallback_keys)
         if not used_fallback:
             raise SystemExit("No usable CBG features found to learn e_size. "
