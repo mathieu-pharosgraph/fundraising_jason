@@ -327,6 +327,40 @@ def main():
     coefs_std = pd.Series(lm.coef_, index=feat_cols)
     coefs_raw = (coefs_std / scale).replace([np.inf, -np.inf], 0).fillna(0.0)
 
+    # ---- RandomForest + permutation importances to widen e_size coverage (optional) ----
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.inspection import permutation_importance
+
+    rf = RandomForestRegressor(
+        n_estimators=400, max_depth=None, min_samples_leaf=3, n_jobs=-1, random_state=42
+    )
+    # Use the standardized imput/scale X the pipeline sees:
+    X_std = pipe.named_steps["pre"].transform(X)
+    rf.fit(X_std, y)
+
+    # permutation importance on standardized X (robust to scale)
+    pi = permutation_importance(rf, X_std, y, n_repeats=5, random_state=42, n_jobs=-1)
+    rf_imp = pd.Series(pi.importances_mean, index=feat_cols).clip(lower=0.0)
+    if rf_imp.sum() > 0:
+        rf_imp = rf_imp / rf_imp.sum()
+
+    # ridge weights on raw scale (coefs_raw) -> convert to positive importances
+    ridge_imp = coefs_raw.abs()
+    if ridge_imp.sum() > 0:
+        ridge_imp = ridge_imp / ridge_imp.sum()
+
+    # blend (70% ridge signal + 30% RF importance)
+    blend = 0.7 * ridge_imp + 0.3 * rf_imp.reindex(ridge_imp.index).fillna(0.0)
+
+    # restore signs from ridge for features where ridge sign was nonzero; otherwise keep positive
+    sign = np.sign(coefs_raw).replace(0, 1.0)
+    e_size_blend = (blend * sign)
+
+    # swap into the export instead of e_size = coefs_raw.copy()
+    e_size = e_size_blend.copy()
+    s = e_size.abs().sum()
+    if s > 0: e_size = e_size / s
+
     # 6) Normalize to sum |w| = 1 and write e_size table
     e_size = coefs_raw.copy()
     s = e_size.abs().sum()
