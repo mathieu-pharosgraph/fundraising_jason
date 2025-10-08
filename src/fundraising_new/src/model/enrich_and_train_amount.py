@@ -29,10 +29,11 @@ def _z5(s: pd.Series) -> pd.Series:
     return s.astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
 
 def enrich_cbg_with_acs(cbg_path: str, acs_parquet: str|None, acs_csv: str|None) -> list[str]:
-    """Add owner_occ_rate and poverty_rate to cbg_features if available in ACS; derive if raw parts exist."""
+    """Add owner_occ_rate and poverty_rate to cbg_features if we can detect/derive them."""
     added = []
     cbg = pd.read_parquet(cbg_path)
-    cbg["zcta"] = _z5(cbg["zcta"])
+    cbg["zcta"] = cbg["zcta"].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+
     acs = None
     if acs_parquet and Path(acs_parquet).exists():
         acs = pd.read_parquet(acs_parquet)
@@ -42,45 +43,88 @@ def enrich_cbg_with_acs(cbg_path: str, acs_parquet: str|None, acs_csv: str|None)
         return added
 
     acs = acs.copy()
-    if "zcta" not in acs.columns:
-        # attempt to detect any zcta-like col
-        zcand = next((c for c in acs.columns if c.lower() in ("zcta","zip","zip5","zcta5","zipcode","zcta5ce10","geoid10","geoid")), None)
-        if not zcand:
-            return added
-        acs["zcta"] = _z5(acs[zcand])
-    acs["zcta"] = _z5(acs["zcta"])
+    zcand = next((c for c in acs.columns if c.lower() in ("zcta","zip","zip5","zcta5","zipcode","zcta5ce10","geoid10","geoid")), None)
+    if not zcand:
+        return added
+    acs["zcta"] = acs[zcand].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
 
-    # direct if present
-    for c in ("owner_occ_rate","poverty_rate"):
-        if c in acs.columns:
-            acs[c] = pd.to_numeric(acs[c], errors="coerce")
+    # Coerce any likely numeric columns
+    def znum(c): 
+        return pd.to_numeric(acs[c], errors="coerce") if c in acs.columns else None
 
-    # derive owner_occ_rate if needed
-    if "owner_occ_rate" not in acs.columns:
-        own_num = next((c for c in acs.columns if re.fullmatch(r"(?i)(B25003_002E|owner_occ_num|owner_occ_households)", c)), None)
-        own_den = next((c for c in acs.columns if re.fullmatch(r"(?i)(B25003_001E|households_total)", c)), None)
-        if own_num and own_den:
-            num = pd.to_numeric(acs[own_num], errors="coerce")
-            den = pd.to_numeric(acs[own_den], errors="coerce").replace(0, np.nan)
-            acs["owner_occ_rate"] = (num/den * 100).clip(0,100)
+    # ----- OWNER OCCUPANCY -----
+    # direct rate?
+    own_rate = znum("owner_occ_rate")
+    # derive from B25003 owner-occupied (002E)/total (001E) or an equivalent pair
+    own_num = next((c for c in acs.columns if c.upper() in {"B25003_002E","OWNER_OCC_NUM","OWNER_OCC_HOUSEHOLDS"}), None)
+    own_den = next((c for c in acs.columns if c.upper() in {"B25003_001E","HOUSEHOLDS_TOTAL"}), None)
+    if own_rate is None and own_num and own_den:
+        num = znum(own_num); den = znum(own_den)
+        if num is not None and den is not None:
+            own_rate = (num/den.replace(0, pd.NA) * 100).clip(0,100)
 
-    # derive poverty_rate if needed
-    if "poverty_rate" not in acs.columns:
-        pov_num = next((c for c in acs.columns if re.fullmatch(r"(?i)(poverty_num|below_poverty|B17001_pov_sum)", c)), None)
-        pov_den = next((c for c in acs.columns if re.fullmatch(r"(?i)(pop_total|population|B17001_001E)", c)), None)
-        if pov_num and pov_den:
-            num = pd.to_numeric(acs[pov_num], errors="coerce")
-            den = pd.to_numeric(acs[pov_den], errors="coerce").replace(0, np.nan)
-            acs["poverty_rate"] = (num/den * 100).clip(0,100)
+    # ----- POVERTY RATE -----
+    pov_rate = znum("poverty_rate")
+    pov_num = next((c for c in acs.columns if c.upper() in {"POVERTY_NUM","BELOW_POVERTY","B17001_POV_SUM"}), None)
+    pov_den = next((c for c in acs.columns if c.upper() in {"POP_TOTAL","POPULATION","B17001_001E"}), None)
+    if pov_rate is None and pov_num and pov_den:
+        num = znum(pov_num); den = znum(pov_den)
+        if num is not None and den is not None:
+            pov_rate = (num/den.replace(0, pd.NA) * 100).clip(0,100)
 
-    keep = [c for c in ["zcta","owner_occ_rate","poverty_rate"] if c in acs.columns]
-    if len(keep) > 1:
-        add = acs[keep].copy()
+    cols = {"zcta": acs["zcta"]}
+    if own_rate is not None: cols["owner_occ_rate"] = own_rate
+    if pov_rate is not None: cols["poverty_rate"]   = pov_rate
+    if len(cols) > 1:
+        add = pd.DataFrame(cols)
         out = cbg.merge(add, on="zcta", how="left")
         out.to_parquet(cbg_path, index=False)
-        if "owner_occ_rate" in keep: added.append("owner_occ_rate")
-        if "poverty_rate" in keep:   added.append("poverty_rate")
+        if "owner_occ_rate" in cols: added.append("owner_occ_rate")
+        if "poverty_rate"   in cols: added.append("poverty_rate")
     return added
+
+
+    acs = acs.copy()
+    zcand = next((c for c in acs.columns if c.lower() in ("zcta","zip","zip5","zcta5","zipcode","zcta5ce10","geoid10","geoid")), None)
+    if not zcand:
+        return added
+    acs["zcta"] = acs[zcand].astype(str).str.extract(r"(\d{5})")[0].str.zfill(5)
+
+    # Coerce any likely numeric columns
+    def znum(c): 
+        return pd.to_numeric(acs[c], errors="coerce") if c in acs.columns else None
+
+    # ----- OWNER OCCUPANCY -----
+    # direct rate?
+    own_rate = znum("owner_occ_rate")
+    # derive from B25003 owner-occupied (002E)/total (001E) or an equivalent pair
+    own_num = next((c for c in acs.columns if c.upper() in {"B25003_002E","OWNER_OCC_NUM","OWNER_OCC_HOUSEHOLDS"}), None)
+    own_den = next((c for c in acs.columns if c.upper() in {"B25003_001E","HOUSEHOLDS_TOTAL"}), None)
+    if own_rate is None and own_num and own_den:
+        num = znum(own_num); den = znum(own_den)
+        if num is not None and den is not None:
+            own_rate = (num/den.replace(0, pd.NA) * 100).clip(0,100)
+
+    # ----- POVERTY RATE -----
+    pov_rate = znum("poverty_rate")
+    pov_num = next((c for c in acs.columns if c.upper() in {"POVERTY_NUM","BELOW_POVERTY","B17001_POV_SUM"}), None)
+    pov_den = next((c for c in acs.columns if c.upper() in {"POP_TOTAL","POPULATION","B17001_001E"}), None)
+    if pov_rate is None and pov_num and pov_den:
+        num = znum(pov_num); den = znum(pov_den)
+        if num is not None and den is not None:
+            pov_rate = (num/den.replace(0, pd.NA) * 100).clip(0,100)
+
+    cols = {"zcta": acs["zcta"]}
+    if own_rate is not None: cols["owner_occ_rate"] = own_rate
+    if pov_rate is not None: cols["poverty_rate"]   = pov_rate
+    if len(cols) > 1:
+        add = pd.DataFrame(cols)
+        out = cbg.merge(add, on="zcta", how="left")
+        out.to_parquet(cbg_path, index=False)
+        if "owner_occ_rate" in cols: added.append("owner_occ_rate")
+        if "poverty_rate"   in cols: added.append("poverty_rate")
+    return added
+
 
 def enrich_cbg_with_naics(cbg_path: str, naics_path: str|None) -> list[str]:
     """Merge NAICS employment shares (0..1) by ZCTA if provided."""
