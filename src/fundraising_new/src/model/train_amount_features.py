@@ -90,21 +90,73 @@ def load_fec_zip_table(path):
 def best_alias(df_cols, key):
     """Return best column name in df for a basis feature_key; handles common aliases."""
     aliases = {
-        "pct_bachelor_plus": ["pct_bachelor_plus","pct_bachelors_plus","pct_ba_plus"],
-        "median_hh_income":  ["median_hh_income","median_income","B19013_001E"],
-        "urban_q":           ["urban_q","metro_micro","cbsa_cat_num","urban_simple"],
-        "share_dem":         ["share_dem","p_donate_dem","party_dem_share"],  # loose
-        "share_gop":         ["share_gop","p_donate_rep","party_rep_share"],
+        # BASIS KEYS  → CBG column candidates
+        "income": ["median_hh_income","median_income","B19013_001E"],
+        "educ": ["pct_bachelors_plus","pct_bachelor_plus","pct_ba_plus"],
+        "internet_home": ["pct_broadband","broadband_rate"],
+        "home_owner": ["owner_occ_rate"],
+        "urban_simple": ["urban_q","metro_micro","cbsa_cat_num"],
+
+        # if you keep these in basis too, include them
+        "poverty_rate": ["poverty_rate"],
+        "median_gross_rent": ["median_gross_rent"],
+        "median_home_value": ["median_home_value"],
+        "rent_as_income_pct": ["rent_as_income_pct"],
+        "ntee_public_affairs_per_1k": ["ntee_public_affairs_per_1k"],
+        "ntee_total_per_1k": ["ntee_total_per_1k"],
+
+        # party mix (optional if present in CBG)
+        "share_dem": ["share_dem"],
+        "share_gop": ["share_gop"],
     }
-    if key in df_cols: return key
+    # exact match first
+    if key in df_cols:
+        return key
+    # try alias list for this basis key
     for cand in aliases.get(key, []):
-        if cand in df_cols: return cand
-    # exact alphanumeric match
+        if cand in df_cols:
+            return cand
+    # final fallback: exact alphanumeric match
     norm = lambda s: re.sub(r"[^a-z0-9]+","", s.lower())
     for c in df_cols:
         if norm(c) == norm(key):
             return c
     return None
+
+def _clean_feature_series(key: str, s: pd.Series) -> pd.Series:
+    """Sanitize units/sentinels/ranges before aggregation."""
+    s = pd.to_numeric(s, errors="coerce")
+
+    # % / share variables → clamp to 0..100
+    pct_like = {"educ","internet_home","rent_as_income_pct",
+                "pct_bachelors_plus","pct_bachelor_plus","pct_broadband","pct_snap"}
+    if key in pct_like or key.startswith("pct_"):
+        return s.clip(0, 100)
+
+    # money-ish variables in dollars → clamp to reasonable range
+    if key in {"income","median_hh_income","median_income","B19013_001E",
+               "median_gross_rent","median_home_value"}:
+        s = s.mask(s <= 0, np.nan)                    # drop non-positive sentinels (e.g., -666666666)
+        if key in {"median_hh_income","median_income","income","B19013_001E"}:
+            return s.clip(5_000, 300_000)
+        if key == "median_gross_rent":
+            return s.clip(200, 5_000)
+        if key == "median_home_value":
+            return s.clip(10_000, 5_000_000)
+
+    # per-1k counts → trim fat tails
+    if key in {"ntee_public_affairs_per_1k","ntee_total_per_1k"}:
+        return s.clip(0, 300)
+
+    # ownership rate / home_owner (if present as 0..1) → project to 0..100
+    if key in {"home_owner","owner_occ_rate"}:
+        if s.quantile(0.95) <= 1.5:  # looks like 0..1
+            s = s * 100.0
+        return s.clip(0, 100)
+
+    # default passthrough
+    return s
+
 
 def align_feature_matrix(cbg, basis_keys):
     """
@@ -122,7 +174,7 @@ def align_feature_matrix(cbg, basis_keys):
         col = best_alias(cbg.columns, key)
         if col is None:
             continue
-        s = pd.to_numeric(cbg[col], errors="coerce")
+        s = _clean_feature_series(key, cbg[col])
         cols[key] = s
         used.append(key)
 
@@ -131,17 +183,19 @@ def align_feature_matrix(cbg, basis_keys):
         return pd.DataFrame({"zip5": cbg["zip5"].values}).drop_duplicates(), []
 
     out = pd.DataFrame(cols)
-    # aggregate to ZIP (weighted mean by adults_18plus if present)
+    num_keys = [k for k in cols.keys() if k not in ("zip5","__w")]
     if "adults_18plus" in cbg.columns:
         out["__w"] = pd.to_numeric(cbg["adults_18plus"], errors="coerce").fillna(0.0).values
-        def wmean(g):
-            denom = g["__w"].sum() or 1.0
-            return pd.Series({k: pd.to_numeric(g[k], errors="coerce").mul(g["__w"]).sum()/denom
-                              for k in cols.keys() if k not in ("zip5","__w")})
-        Z = out.groupby("zip5", as_index=False).apply(lambda g: wmean(g)).reset_index()
-        Z = Z.drop(columns=["level_0","level_1"], errors="ignore")
+        wsum = out.groupby("zip5")["__w"].sum().replace(0, np.nan)
+        num = out[num_keys].apply(pd.to_numeric, errors="coerce").multiply(out["__w"], axis=0)
+        Z = num.groupby(out["zip5"]).sum().div(wsum, axis=0).reset_index().rename(columns={"zip5":"zip5"})
     else:
-        Z = out.groupby("zip5", as_index=False).mean(numeric_only=True)
+        Z = out.groupby("zip5", as_index=False)[num_keys].mean(numeric_only=True)
+    # keep zip5 at the front
+    Z = Z if "zip5" in Z.columns else Z.rename(columns={"index":"zip5"})
+
+
+
 
 
 
@@ -180,7 +234,6 @@ def main():
 
     # 3) Build ZIP-level feature matrix aligned to basis
     Z, used_keys = align_feature_matrix(cbg, basis_keys)  # Z: zip5 + mapped features
-    # DEBUG: save ZIP matrix to inspect variance later
     try:
         Path(args.outdir).mkdir(parents=True, exist_ok=True)
         Z.to_parquet(Path(args.outdir) / "zip_matrix_debug.parquet", index=False)
@@ -216,16 +269,25 @@ def main():
 
     D = fec.merge(Z, on="zip5", how="inner").dropna(subset=["avg_amount_zip"])
 
-    # quick variance/correlation audit
     aud = []
-    for c in [col for col in D.columns if c not in ("zip5","avg_amount_zip")]:
-        s = pd.to_numeric(D[c], errors="coerce")
+    for col in [c for c in D.columns if c not in ("zip5","avg_amount_zip")]:
+        s = pd.to_numeric(D[col], errors="coerce")
         if s.notna().any():
-            aud.append((c, float(s.std()), float(np.nan_to_num(np.corrcoef(s.fillna(0), D["avg_amount_zip"])[0,1]))))
+            try:
+                corr = float(np.corrcoef(s.fillna(0), D["avg_amount_zip"])[0,1])
+            except Exception:
+                corr = 0.0
+            aud.append((col, float(s.std()), corr))
     if aud:
-        A = pd.DataFrame(aud, columns=["feature","std_zip","corr_with_amount"]).sort_values("std_zip", ascending=False)
+        A = (pd.DataFrame(aud, columns=["feature","std_zip","corr_with_amount"])
+            .sort_values("std_zip", ascending=False))
         A.to_csv(Path(args.outdir)/"amount_feature_variance_corr.csv", index=False)
         print("[debug] wrote amount_feature_variance_corr.csv")
+
+
+
+    # quick variance/correlation audit
+    feat_cols = [col for col in D.columns if col not in ("zip5","avg_amount_zip")]
 
     # final feature set
     feat_cols = [c for c in D.columns if c not in ("zip5","avg_amount_zip")]
