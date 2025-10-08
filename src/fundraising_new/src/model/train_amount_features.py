@@ -108,6 +108,16 @@ def best_alias(df_cols, key):
         # party mix (optional if present in CBG)
         "share_dem": ["share_dem"],
         "share_gop": ["share_gop"],
+
+        # industries
+        "emp_share_manufacturing": ["emp_share_manufacturing"],
+        "emp_share_retail": ["emp_share_retail"],
+        "emp_share_healthcare_social": ["emp_share_healthcare_social"],
+        "emp_share_professional_scientific_mgmt": ["emp_share_professional_scientific_mgmt"],
+        "emp_share_information": ["emp_share_information"],
+        # (optionally)
+        "emp_share_agriculture": ["emp_share_agriculture"],
+        "emp_share_other_services": ["emp_share_other_services"],
     }
     # exact match first
     if key in df_cols:
@@ -349,8 +359,8 @@ def main():
     if ridge_imp.sum() > 0:
         ridge_imp = ridge_imp / ridge_imp.sum()
 
-    # blend (70% ridge signal + 30% RF importance)
-    blend = 0.7 * ridge_imp + 0.3 * rf_imp.reindex(ridge_imp.index).fillna(0.0)
+    # blend (50% ridge signal + 50% RF importance)
+    blend = 0.5 * ridge_imp + 0.5 * rf_imp.reindex(ridge_imp.index).fillna(0.0)
 
     # restore signs from ridge for features where ridge sign was nonzero; otherwise keep positive
     sign = np.sign(coefs_raw).replace(0, 1.0)
@@ -363,10 +373,20 @@ def main():
     if s > 0:
         e_size = e_size / s
 
+    # DEBUG: write top blended weights
+    (
+        e_size.rename("e_size_blend")
+            .reset_index().rename(columns={"index":"feature_key"})
+            .sort_values("e_size_blend", key=abs, ascending=False)
+            .head(20)
+    ).to_csv(Path(args.outdir)/"amount_esize_blend_debug.csv", index=False)
+    print("[debug] wrote", Path(args.outdir)/"amount_esize_blend_debug.csv")
+
     basis_e = (
         e_size.rename("e_size").reset_index().rename(columns={"index":"feature_key"})
     )
     basis_e["feature_key"] = basis_e["feature_key"].astype(str).str.lower()
+
 
     
     # --- Map CBG feature names to existing basis keys before merge ---
@@ -393,6 +413,7 @@ def main():
                 .assign(abs=lambda d: d["coef"].abs())
                 .sort_values("abs", ascending=False))
     coef_tbl.head(20).to_csv(Path(args.outdir)/"amount_coef_debug.csv", index=False)
+
     print("Top raw coefs (abs):")
     print(coef_tbl.head(15).to_string(index=False))
 
