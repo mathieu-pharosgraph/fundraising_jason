@@ -219,16 +219,29 @@ def main():
 
     # 1) enrich cbg_features
     added_acs   = enrich_cbg_with_acs(args.cbg_features, args.acs_viz, args.acs_viz_fallback)
-    added_ind = enrich_cbg_with_industry_shares_from_acs(
-        args.cbg_features, args.acs_viz, args.acs_viz_fallback
-    )
-    print("✓ industry shares from ACS:", (",".join(added_ind) if added_ind else "none"))
-
     added_naics = enrich_cbg_with_naics(args.cbg_features, args.naics_shares)
-    print("✓ CBG enrichment:",
-          ("ACS→" + ",".join(added_acs) if added_acs else "ACS none"),
-          "|",
-          ("NAICS→" + ",".join(added_naics) if added_naics else "NAICS none"))
+
+    # If NAICS shares missing and --naics-shares path not available, fetch from ACS now
+    if not added_naics:
+        naics_out = Path(args.naics_shares) if args.naics_shares else Path("fundraising_participation/data/geo/zcta_naics_shares.parquet")
+        if not naics_out.exists():
+            # run the ACS fetcher
+            cmd = [
+                sys.executable,
+                "fundraising_participation/src/model/s5c_fetch_acs_industry_zcta.py",
+                "--year", "2022",
+                "--out", str(naics_out),
+            ]
+            run(cmd)
+        # merge the newly fetched file
+        added_naics = enrich_cbg_with_naics(args.cbg_features, str(naics_out))
+
+    print(
+        "✓ CBG enrichment:",
+        f"ACS→{','.join(added_acs) if added_acs else 'ACS none'}",
+        "|",
+        f"NAICS/ACS→{','.join(added_naics) if added_naics else 'NAICS/ACS none'}",
+    )
 
     # 2) run trainer (Ridge+RF blend)
     run([
