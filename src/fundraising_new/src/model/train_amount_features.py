@@ -397,14 +397,12 @@ def main():
     if s > 0:
         e_size = e_size / s
 
-    # keep at least K strongest features non-zero (prevents over-concentration)
-    K = 8  # choose 6–12 depending on how broad you want the size basis
-    # rank by absolute weight
+    # Keep at least K strongest features non-zero (prevents collapse to 1-2 variables)
+    K = 8  # adjust to 6–12 depending on breadth you want
     order = e_size.abs().sort_values(ascending=False)
     keep = order.index[:K]
-    # zero out the rest
     e_size.loc[~e_size.index.isin(keep)] = 0.0
-    # re-normalize to L1=1 (if any non-zero)
+    # Re-normalize to L1 = 1 (if any mass)
     s2 = e_size.abs().sum()
     if s2 > 0:
         e_size = e_size / s2
