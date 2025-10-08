@@ -133,16 +133,16 @@ def align_feature_matrix(cbg, basis_keys):
     out = pd.DataFrame(cols)
     # aggregate to ZIP (weighted mean by adults_18plus if present)
     if "adults_18plus" in cbg.columns:
-        w = pd.to_numeric(cbg["adults_18plus"], errors="coerce").fillna(0.0)
-        out["__w"] = w.values
-        Z = (out.groupby("zip5")
-                .apply(lambda g: pd.Series({
-                    **{k: pd.to_numeric(g[k], errors="coerce").mul(g["__w"]).sum() / (g["__w"].sum() or 1.0)
-                    for k in g.columns if k not in ("zip5","__w")}
-                }))
-                .reset_index())
+        out["__w"] = pd.to_numeric(cbg["adults_18plus"], errors="coerce").fillna(0.0).values
+        def wmean(g):
+            denom = g["__w"].sum() or 1.0
+            return pd.Series({k: pd.to_numeric(g[k], errors="coerce").mul(g["__w"]).sum()/denom
+                              for k in cols.keys() if k not in ("zip5","__w")})
+        Z = out.groupby("zip5", as_index=False).apply(lambda g: wmean(g)).reset_index()
+        Z = Z.drop(columns=["level_0","level_1"], errors="ignore")
     else:
-        Z = out.groupby("zip5").mean(numeric_only=True).reset_index()
+        Z = out.groupby("zip5", as_index=False).mean(numeric_only=True)
+
 
 
     # drop columns that are all-NaN or constant
@@ -180,6 +180,14 @@ def main():
 
     # 3) Build ZIP-level feature matrix aligned to basis
     Z, used_keys = align_feature_matrix(cbg, basis_keys)  # Z: zip5 + mapped features
+    # DEBUG: save ZIP matrix to inspect variance later
+    try:
+        Path(args.outdir).mkdir(parents=True, exist_ok=True)
+        Z.to_parquet(Path(args.outdir) / "zip_matrix_debug.parquet", index=False)
+        print(f"[debug] wrote {Path(args.outdir) / 'zip_matrix_debug.parquet'} with cols={list(Z.columns)[:12]}")
+    except Exception as e:
+        print(f"[debug] failed to write zip_matrix_debug: {e}")
+
     if not used_keys:
         # Fallback to a broader, interpretable set commonly present in CBG features
         fallback_keys = [
@@ -208,6 +216,17 @@ def main():
 
     D = fec.merge(Z, on="zip5", how="inner").dropna(subset=["avg_amount_zip"])
 
+    # quick variance/correlation audit
+    aud = []
+    for c in [col for col in D.columns if c not in ("zip5","avg_amount_zip")]:
+        s = pd.to_numeric(D[c], errors="coerce")
+        if s.notna().any():
+            aud.append((c, float(s.std()), float(np.nan_to_num(np.corrcoef(s.fillna(0), D["avg_amount_zip"])[0,1]))))
+    if aud:
+        A = pd.DataFrame(aud, columns=["feature","std_zip","corr_with_amount"]).sort_values("std_zip", ascending=False)
+        A.to_csv(Path(args.outdir)/"amount_feature_variance_corr.csv", index=False)
+        print("[debug] wrote amount_feature_variance_corr.csv")
+
     # final feature set
     feat_cols = [c for c in D.columns if c not in ("zip5","avg_amount_zip")]
     # defensive prune: remove any remaining all-NaN/constant/non-numeric columns
@@ -222,7 +241,7 @@ def main():
                         "Confirm cbg_features and chosen keys.")
 
     X = D[feat_cols].copy()
-    y = D["avg_amount_zip"].astype(float).values
+    y = np.log1p(D["avg_amount_zip"].astype(float).values)  # instead of raw amount
 
     pre = ColumnTransformer([
         ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
@@ -274,6 +293,13 @@ def main():
     s2 = basis_e_mapped["e_size"].abs().sum()
     if s2 > 0:
         basis_e_mapped["e_size"] = basis_e_mapped["e_size"] / s2
+
+    coef_tbl = (coefs_raw.rename("coef").reset_index().rename(columns={"index":"feature_key"})
+                .assign(abs=lambda d: d["coef"].abs())
+                .sort_values("abs", ascending=False))
+    coef_tbl.head(20).to_csv(Path(args.outdir)/"amount_coef_debug.csv", index=False)
+    print("Top raw coefs (abs):")
+    print(coef_tbl.head(15).to_string(index=False))
 
     # Save model artifacts
     pd.DataFrame({
