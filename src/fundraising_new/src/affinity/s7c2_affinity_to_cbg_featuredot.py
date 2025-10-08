@@ -74,6 +74,8 @@ def main():
 
     # 2) Which weight columns exist in basis
     want_cols = [c for c in ["w_dem_comb","w_gop_comb","w_cand_comb","w_org_comb","e_size"] if c in B.columns]
+    if "p_any" in B.columns:
+        want_cols.append("p_any")  # will be emitted as affinity_cbg_any
     if not want_cols:
         raise SystemExit("Basis has no combined weights; add w_dem_comb/w_gop_comb or e_size first.")
 
@@ -111,9 +113,11 @@ def main():
             dots = (M * (story_w * basis_w)).sum(axis=1)  # (N_cbgs,)
             lift = np.clip(dots, -args.clip, args.clip)
             score = 1.0 * (1.0 + args.lam * lift)         # base=1.0; can be replaced per-party later
+            out_name = ("affinity_cbg_" + colname.split("_",1)[1]) if colname.startswith("w_") else \
+                    ("affinity_cbg_any" if colname=="p_any" else f"affinity_cbg_{colname}")
             out_rows.append(pd.DataFrame({
                 "period": period, "label": label, "cbg_id": Z["cbg_id"],
-                colname.replace("w_","affinity_cbg_"): score.astype(np.float32),
+                out_name: score.astype(np.float32),
             }))
 
     if not out_rows:
