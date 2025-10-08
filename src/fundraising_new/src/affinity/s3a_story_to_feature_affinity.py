@@ -18,16 +18,18 @@ def deepseek_chat(messages, model="deepseek-chat", max_tokens=600, temperature=0
 
 PROMPT = """You will score how a political STORY activates a compact set of donor-predictive FEATURES.
 Return STRICT JSON ONLY like:
-{"weights": {"feature_key": weight, ...}, "top": [{"feature_key":"...", "why":"..."}]}
+{{"weights": {{"feature_key": 0.0}}, "top": [{{"feature_key":"...", "why":"..."}}]}}
+
 Rules:
 - Only use features from this list (exact keys): {feature_keys}
 - Weights in [-1, 1], 0 = not relevant. Be sparse (<= 8 non-zeros).
-- Positive weight = story increases that feature's political fundraising relevance; negative = decreases.
+- Positive weight = story increases that feature's fundraising relevance; negative = decreases.
 - Provide 2-3 short "why" justifications in the "top" array for the strongest weights.
 
 STORY (period={period}, label={label}):
 {snippet}
 """
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -40,7 +42,52 @@ def main():
 
     # features we allow the scorer to use
     B = pd.read_parquet(args.basis)
-    feature_keys = sorted(B["feature_key"].astype(str).unique().tolist())
+    all_keys = sorted(B["feature_key"].astype(str).unique().tolist())
+
+    # Optional: restrict to keys that actually exist (or can be aliased) in CBG features
+    # This keeps the LLM’s menu aligned with what the feature-dot stage can use later.
+    try:
+        C = pd.read_parquet("fundraising_participation/data/geo/cbg_features.parquet")
+        df_cols = set(C.columns)
+
+        # minimal alias map (mirror of your trainer/mapper)
+        alias = {
+            "income": ["median_hh_income","median_income","B19013_001E"],
+            "educ": ["pct_bachelors_plus","pct_bachelor_plus","pct_ba_plus"],
+            "internet_home": ["pct_broadband","broadband_rate"],
+            "home_owner": ["owner_occ_rate"],
+            "urban_simple": ["urban_q","metro_micro","cbsa_cat_num"],
+            "poverty_rate": ["poverty_rate"],
+            "median_gross_rent": ["median_gross_rent"],
+            "median_home_value": ["median_home_value"],
+            "rent_as_income_pct": ["rent_as_income_pct"],
+            "ntee_public_affairs_per_1k": ["ntee_public_affairs_per_1k"],
+            "ntee_total_per_1k": ["ntee_total_per_1k"],
+            "share_dem": ["share_dem"], "share_gop": ["share_gop"],
+            "emp_share_manufacturing": ["emp_share_manufacturing"],
+            "emp_share_retail": ["emp_share_retail"],
+            "emp_share_healthcare_social": ["emp_share_healthcare_social"],
+            "emp_share_professional_scientific_mgmt": ["emp_share_professional_scientific_mgmt"],
+            "emp_share_information": ["emp_share_information"],
+            # optional:
+            "emp_share_agriculture": ["emp_share_agriculture"],
+            "emp_share_other_services": ["emp_share_other_services"],
+        }
+
+        def mappable(k):
+            if k in df_cols: 
+                return True
+            for cand in alias.get(k, []):
+                if cand in df_cols:
+                    return True
+            return False
+
+        feature_keys = [k for k in all_keys if mappable(k)]
+        # if for some reason we filtered everything, fall back to all_keys
+        if not feature_keys:
+            feature_keys = all_keys
+    except Exception:
+        feature_keys = all_keys
 
     # Representative text (reuse your S3 items/clusters)
     items   = pd.read_parquet(Path(args.topics_dir)/"items.parquet")
