@@ -240,12 +240,31 @@ def main():
     B = pd.read_parquet(args.basis_in)
     basis_keys = B["feature_key"].dropna().astype(str).unique().tolist()
 
+    # extra candidates we want to allow even if not in the basis yet
+    extra_keys = [
+        # industries (now present thanks to your ACS fetch)
+        "emp_share_manufacturing",
+        "emp_share_retail",
+        "emp_share_healthcare_social",
+        "emp_share_professional_scientific_mgmt",
+        "emp_share_information",
+        # useful socio-econ you said you want
+        "owner_occ_rate",
+        "poverty_rate",
+        "median_home_value",
+        "median_gross_rent",
+    ]
+
+    # ask for the union (basis ∪ extras)
+    want_keys = sorted(set(basis_keys) | set(extra_keys))
+
+
     # 2) Load data
     fec = load_fec_zip_table(args.fec_zip)  # zip5, avg_amount_zip
     cbg = pd.read_parquet(args.cbg_features)
 
     # 3) Build ZIP-level feature matrix aligned to basis
-    Z, used_keys = align_feature_matrix(cbg, basis_keys)  # Z: zip5 + mapped features
+    Z, used_keys = align_feature_matrix(cbg, want_keys)   # Z: zip5 + mapped features (basis ∪ extras)
     try:
         Path(args.outdir).mkdir(parents=True, exist_ok=True)
         Z.to_parquet(Path(args.outdir) / "zip_matrix_debug.parquet", index=False)
@@ -278,6 +297,7 @@ def main():
                             "Check cbg_features columns or extend alias map.")
         print(f"[info] using fallback features for e_size: {used_fallback}")
         Z, used_keys = Z_fallback, used_fallback
+    print("[debug] used_keys:", used_keys[:20], "…", f"({len(used_keys)} total)")
 
     D = fec.merge(Z, on="zip5", how="inner").dropna(subset=["avg_amount_zip"])
 
