@@ -143,6 +143,12 @@ def enrich_cbg_with_naics(cbg_path: str, naics_path: str|None) -> list[str]:
         for c in have:
             if c != "zcta":
                 add[c] = pd.to_numeric(add[c], errors="coerce").clip(0,1)
+
+        # drop any existing emp_share_* from cbg to avoid suffix collisions
+        drop_cols = [c for c in cbg.columns if c.startswith("emp_share_")]
+        if drop_cols:
+            cbg = cbg.drop(columns=drop_cols)
+
         out = cbg.merge(add, on="zcta", how="left")
         out.to_parquet(cbg_path, index=False)
         added += [c for c in have if c != "zcta"]
