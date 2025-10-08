@@ -265,6 +265,8 @@ def main():
 
     # 3) Build ZIP-level feature matrix aligned to basis
     Z, used_keys = align_feature_matrix(cbg, want_keys)   # Z: zip5 + mapped features (basis ∪ extras)
+    print("[debug] used_keys:", used_keys[:20], "…", f"({len(used_keys)} total)")
+
     try:
         Path(args.outdir).mkdir(parents=True, exist_ok=True)
         Z.to_parquet(Path(args.outdir) / "zip_matrix_debug.parquet", index=False)
@@ -395,6 +397,18 @@ def main():
     if s > 0:
         e_size = e_size / s
 
+    # keep at least K strongest features non-zero (prevents over-concentration)
+    K = 8  # choose 6–12 depending on how broad you want the size basis
+    # rank by absolute weight
+    order = e_size.abs().sort_values(ascending=False)
+    keep = order.index[:K]
+    # zero out the rest
+    e_size.loc[~e_size.index.isin(keep)] = 0.0
+    # re-normalize to L1=1 (if any non-zero)
+    s2 = e_size.abs().sum()
+    if s2 > 0:
+        e_size = e_size / s2
+        
     # DEBUG: write top blended weights
     (
         e_size.rename("e_size_blend")
