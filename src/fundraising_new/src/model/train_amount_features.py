@@ -356,19 +356,18 @@ def main():
     sign = np.sign(coefs_raw).replace(0, 1.0)
     e_size_blend = (blend * sign)
 
-    # swap into the export instead of e_size = coefs_raw.copy()
+    # ---- Use the RF + Ridge BLEND as final e_size ----
     e_size = e_size_blend.copy()
+    # L1 normalize for comparability across targets
     s = e_size.abs().sum()
-    if s > 0: e_size = e_size / s
+    if s > 0:
+        e_size = e_size / s
 
-    # 6) Normalize to sum |w| = 1 and write e_size table
-    e_size = coefs_raw.copy()
-    s = e_size.abs().sum()
-    if s > 0: e_size = e_size / s
-    basis_e = (e_size.rename("e_size").reset_index()
-               .rename(columns={"index":"feature_key"}))
-    # ensure feature_key lowercased to match basis
+    basis_e = (
+        e_size.rename("e_size").reset_index().rename(columns={"index":"feature_key"})
+    )
     basis_e["feature_key"] = basis_e["feature_key"].astype(str).str.lower()
+
     
     # --- Map CBG feature names to existing basis keys before merge ---
     alias_to_basis = {
