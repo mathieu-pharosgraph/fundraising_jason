@@ -91,6 +91,21 @@ def main():
 
     # 1) Load inputs
     S = pd.read_parquet(args.story_features)   # period,label,feature_key,weight
+    # --- HARD FILTER: keep only labels present in S4 political file ---
+    if Path(args.s4).exists():
+        S4 = pd.read_parquet(args.s4)
+        lab_candidates = ["story_label","label","winner_label","best_label"]
+        lab_s4 = next((c for c in lab_candidates if c in S4.columns), None)
+        if lab_s4 is not None:
+            # remove explicitly non-political
+            S4 = S4[~S4["classification"].fillna("non-political").str.contains("non-political", case=False)]
+            S["label_key"] = S["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
+            S4["label_key"] = S4[lab_s4].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
+            keep = set(S4["label_key"].dropna().unique().tolist())
+            before = len(S)
+            S = S[S["label_key"].isin(keep)].drop(columns=["label_key"])
+            print(f"political filter: {len(S)}/{before} rows kept in story_features")
+
     B = pd.read_parquet(args.basis)            # feature_key + weight columns
     C = pd.read_parquet(args.cbg_features)
     C["cbg_id"] = C["cbg_id"].astype(str)
