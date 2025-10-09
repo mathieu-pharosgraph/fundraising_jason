@@ -98,9 +98,10 @@ def main():
 
     if "p_any" in B.columns:
         want_cols.append("p_any")  # will be emitted as affinity_cbg_any
+    want_cols = list(dict.fromkeys(want_cols))
     if not want_cols:
         raise SystemExit("Basis has no combined weights; add w_dem_comb/w_gop_comb or e_size first.")
-    want_cols = list(dict.fromkeys(want_cols))
+
 
     # 3) Prepare a CBG feature matrix for the union of feature_keys appearing in S∩B
     feat_keys = sorted(set(B["feature_key"].astype(str)) & set(S["feature_key"].astype(str)))
@@ -113,11 +114,11 @@ def main():
         if not col:
             continue
         s = pd.to_numeric(C[col], errors="coerce")
-        if s.notna().sum() < 2:   # must have at least a couple of non-nulls
+        # ↓ add this check
+        if s.notna().sum() < 2:
             continue
         colmap[k] = col
-    if not colmap:
-        raise SystemExit("No story/basis features map to CBG columns. Extend alias map.")
+
 
 
 
@@ -158,19 +159,46 @@ def main():
         print(f"✓ wrote {args.out} (empty; no overlapping features)")
         return
 
-    # de-duplicate frames by their single score column name
-    by_col = {}
-    for df in out_rows:
-        score_cols = [c for c in df.columns if c.startswith("affinity_cbg_")]
-        if not score_cols:
+    # build one wide frame per (period,label), then concat vertically
+    wide_rows = []
+    for (period, label), g in S.groupby(["period","label"]):
+        sw = g.set_index("feature_key")["weight"].to_dict()
+        keys = [k for k in colmap.keys() if k in sw]
+        if not keys:
             continue
-        sc = score_cols[0]
-        by_col[sc] = df   # last one wins; change to 'setdefault' if you prefer first
 
-    frames = list(by_col.values())
-    OUT = frames[0]
-    for df in frames[1:]:
-        OUT = OUT.merge(df, on=["period","label","cbg_id"], how="outer")
+        story_w = np.array([float(sw[k]) for k in keys], dtype=float)
+        M = Z[keys].to_numpy(dtype=float)  # (N_cbgs, K)
+
+        base = pd.DataFrame({
+            "period": str(period),
+            "label":  str(label),
+            "cbg_id": Z["cbg_id"],
+        })
+
+        for colname in want_cols:
+            basis_w = np.array(
+                [float(BW.loc[k, colname]) if k in BW.index else 0.0 for k in keys],
+                dtype=float,
+            )
+            dots = (M * (story_w * basis_w)).sum(axis=1)
+            lift = np.clip(dots, -args.clip, args.clip)
+            score = 1.0 * (1.0 + args.lam * lift)
+            out_name = (
+                "affinity_cbg_" + colname.split("_", 1)[1] if colname.startswith("w_")
+                else ("affinity_cbg_any" if colname == "p_any" else f"affinity_cbg_{colname}")
+            )
+            base[out_name] = score.astype(np.float32)
+
+        wide_rows.append(base)
+
+    if not wide_rows:
+        pd.DataFrame(columns=["period","label","cbg_id"]).to_parquet(args.out, index=False)
+        print(f"✓ wrote {args.out} (empty; no overlapping features)")
+        return
+
+    OUT = pd.concat(wide_rows, ignore_index=True)
+
 
 
     # -------- Optional party blending with S4 base potentials --------
@@ -179,46 +207,47 @@ def main():
         if s4p.exists():
             S4 = pd.read_parquet(s4p)
 
-            # choose a label column that exists in S4
-            label_candidates = ["label", "story_label", "winner_label", "best_label"]
+            # choose any label-like column present
+            label_candidates = ["label","story_label","winner_label","best_label"]
             lab_s4 = next((c for c in label_candidates if c in S4.columns), None)
             if lab_s4 is None:
-                print("[warn] S4 has no label-like column (label/story_label/winner_label/best_label). Skipping blend.")
+                print("[warn] S4 has no label-like column. Skipping blend.")
             else:
-                # normalize keys on both sides
-                OUT["label_key"] = OUT["label"].astype(str).apply(norm_key)
-                S4b = S4.copy()
-                S4b["label_key"] = S4b[lab_s4].astype(str).apply(norm_key)
-                if "period" in S4b.columns:
-                    S4b["period"] = S4b["period"].astype(str)
+                # normalize period to ISO (YYYY-MM-DD) on both sides
+                def _norm_period(x):
+                    d = pd.to_datetime(x, errors="coerce", utc=False, infer_datetime_format=True)
+                    return d.dt.date.astype("string")
 
-                # keep fields we need; normalize to 0..1 for potentials
+                OUT["period"] = _norm_period(OUT["period"])
+                S4b = S4.copy()
+                S4b["period"] = _norm_period(S4b["period"]) if "period" in S4b.columns else pd.Series(dtype="string")
+
+                # normalize label keys on both sides
+                OUT["label_key"] = OUT["label"].astype(str).apply(norm_key)
+                S4b["label_key"] = S4b[lab_s4].astype(str).apply(norm_key)
+
+                # scale bases to 0..1
                 keep = ["period","label_key"]
                 for c in ["dem_fundraising_potential","gop_fundraising_potential"]:
                     if c in S4b.columns:
                         S4b[c] = pd.to_numeric(S4b[c], errors="coerce")/100.0
                         keep.append(c)
+
                 S4b = S4b[keep].drop_duplicates(["period","label_key"])
-
-                if "period" in OUT.columns:
-                    OUT["period"] = OUT["period"].astype(str)
-
-                # merge on normalized keys
                 OUT = OUT.merge(S4b, on=["period","label_key"], how="left")
 
-                # safe fill: treat missing base as 1.0 (i.e., no global up/down-weight)
+                # safe defaults = 1.0 → no reweight
                 base_dem = OUT.get("dem_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
                 base_gop = OUT.get("gop_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
-
                 if "affinity_cbg_dem" in OUT.columns:
                     OUT["final_affinity_cbg_dem"] = (OUT["affinity_cbg_dem"].astype(float) * base_dem).astype(np.float32)
                 if "affinity_cbg_gop" in OUT.columns:
                     OUT["final_affinity_cbg_gop"] = (OUT["affinity_cbg_gop"].astype(float) * base_gop).astype(np.float32)
 
-                # tidy helper
                 OUT.drop(columns=["label_key"], inplace=True, errors="ignore")
         else:
             print(f"[warn] --blend-party-with-s4 set but {s4p} not found; skipping blend.")
+
 
 
 
