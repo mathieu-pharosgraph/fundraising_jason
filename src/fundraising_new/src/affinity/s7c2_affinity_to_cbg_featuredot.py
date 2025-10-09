@@ -84,17 +84,23 @@ def main():
     C = pd.read_parquet(args.cbg_features)
     C["cbg_id"] = C["cbg_id"].astype(str)
 
-    # Drop non-projectable categorical features early (e.g., "state")
+    # normalize types & drop non-projectables (e.g., 'state')
     if "feature_key" in S.columns:
         S["feature_key"] = S["feature_key"].astype(str)
         S = S[~S["feature_key"].isin(SKIP_KEYS)]
+    if "period" in S.columns:
+        S["period"] = S["period"].astype(str)
+    if "label" in S.columns:
+        S["label"] = S["label"].astype(str)
 
     # 2) Which weight columns exist in basis
     want_cols = [c for c in ["w_dem_comb","w_gop_comb","w_cand_comb","w_org_comb","e_size"] if c in B.columns]
+
     if "p_any" in B.columns:
         want_cols.append("p_any")  # will be emitted as affinity_cbg_any
     if not want_cols:
         raise SystemExit("Basis has no combined weights; add w_dem_comb/w_gop_comb or e_size first.")
+    want_cols = list(dict.fromkeys(want_cols))
 
     # 3) Prepare a CBG feature matrix for the union of feature_keys appearing in S∩B
     feat_keys = sorted(set(B["feature_key"].astype(str)) & set(S["feature_key"].astype(str)))
@@ -106,14 +112,13 @@ def main():
         col = best_alias(C.columns, k)
         if not col:
             continue
-        # must be numeric-convertible and have at least a couple of non-nulls
         s = pd.to_numeric(C[col], errors="coerce")
-        if s.notna().sum() < 2:
+        if s.notna().sum() < 2:   # must have at least a couple of non-nulls
             continue
         colmap[k] = col
-
     if not colmap:
         raise SystemExit("No story/basis features map to CBG columns. Extend alias map.")
+
 
 
     Z = C[["cbg_id"]].copy()
@@ -153,9 +158,20 @@ def main():
         print(f"✓ wrote {args.out} (empty; no overlapping features)")
         return
 
-    OUT = out_rows[0]
-    for df in out_rows[1:]:
+    # de-duplicate frames by their single score column name
+    by_col = {}
+    for df in out_rows:
+        score_cols = [c for c in df.columns if c.startswith("affinity_cbg_")]
+        if not score_cols:
+            continue
+        sc = score_cols[0]
+        by_col[sc] = df   # last one wins; change to 'setdefault' if you prefer first
+
+    frames = list(by_col.values())
+    OUT = frames[0]
+    for df in frames[1:]:
         OUT = OUT.merge(df, on=["period","label","cbg_id"], how="outer")
+
 
     # -------- Optional party blending with S4 base potentials --------
     if args.blend_party_with_s4:
