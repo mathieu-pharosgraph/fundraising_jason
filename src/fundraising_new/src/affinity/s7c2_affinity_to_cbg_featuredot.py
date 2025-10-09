@@ -160,12 +160,7 @@ def main():
                 s4_map[(p, lk)] = (dem, gop)
 
     # ----- Prepare a ParquetWriter with a fixed schema -----
-    score_names = []
-    for colname in want_cols:
-        score_names.append(
-            "affinity_cbg_" + colname.split("_",1)[1] if colname.startswith("w_")
-            else ("affinity_cbg_any" if colname=="p_any" else f"affinity_cbg_{colname}")
-        )
+    score_names = [score_name(c) for c in want_cols]
 
     fields = [
         pa.field("period", pa.string()),
@@ -211,10 +206,17 @@ def main():
             dots = (M * (story_w * basis_w)).sum(axis=1)
             lift = np.clip(dots, -args.clip, args.clip)
             score = 1.0 * (1.0 + args.lam * lift)
-            out_name = (
-                "affinity_cbg_" + colname.split("_",1)[1] if colname.startswith("w_")
-                else ("affinity_cbg_any" if colname=="p_any" else f"affinity_cbg_{colname}")
-            )
+            def score_name(colname: str) -> str:
+                if colname == "w_dem_comb":  return "affinity_cbg_dem"
+                if colname == "w_gop_comb":  return "affinity_cbg_gop"
+                if colname == "w_cand_comb": return "affinity_cbg_cand"
+                if colname == "w_org_comb":  return "affinity_cbg_org"
+                if colname == "e_size":      return "affinity_cbg_size"
+                if colname == "p_any":       return "affinity_cbg_any"
+                # fallback (shouldn’t trigger in our set)
+                return f"affinity_cbg_{colname}"
+
+            out_name = score_name(colname)
             base[out_name] = score.astype(np.float32)
 
         # optional S4 blend per batch
