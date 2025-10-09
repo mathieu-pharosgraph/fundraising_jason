@@ -178,26 +178,48 @@ def main():
         s4p = Path(args.s4)
         if s4p.exists():
             S4 = pd.read_parquet(s4p)
-            # keep just the fields we need, normalize to 0..1
-            keep = [c for c in ["period","label","dem_fundraising_potential","gop_fundraising_potential"] if c in S4.columns]
-            S4b = S4[keep].copy()
-            S4b["period"] = S4b["period"].astype(str)
-            for c in ["dem_fundraising_potential","gop_fundraising_potential"]:
-                if c in S4b.columns:
-                    S4b[c] = pd.to_numeric(S4b[c], errors="coerce")/100.0
 
-            OUT = OUT.merge(S4b, on=["period","label"], how="left", suffixes=("","_s4"))
+            # choose a label column that exists in S4
+            label_candidates = ["label", "story_label", "winner_label", "best_label"]
+            lab_s4 = next((c for c in label_candidates if c in S4.columns), None)
+            if lab_s4 is None:
+                print("[warn] S4 has no label-like column (label/story_label/winner_label/best_label). Skipping blend.")
+            else:
+                # normalize keys on both sides
+                OUT["label_key"] = OUT["label"].astype(str).apply(norm_key)
+                S4b = S4.copy()
+                S4b["label_key"] = S4b[lab_s4].astype(str).apply(norm_key)
+                if "period" in S4b.columns:
+                    S4b["period"] = S4b["period"].astype(str)
 
-            # safe fill: treat missing base as 1.0 (no global up/down-weight)
-            base_dem = OUT.get("dem_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
-            base_gop = OUT.get("gop_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
+                # keep fields we need; normalize to 0..1 for potentials
+                keep = ["period","label_key"]
+                for c in ["dem_fundraising_potential","gop_fundraising_potential"]:
+                    if c in S4b.columns:
+                        S4b[c] = pd.to_numeric(S4b[c], errors="coerce")/100.0
+                        keep.append(c)
+                S4b = S4b[keep].drop_duplicates(["period","label_key"])
 
-            if "affinity_cbg_dem" in OUT.columns:
-                OUT["final_affinity_cbg_dem"] = (OUT["affinity_cbg_dem"].astype(float) * base_dem).astype(np.float32)
-            if "affinity_cbg_gop" in OUT.columns:
-                OUT["final_affinity_cbg_gop"] = (OUT["affinity_cbg_gop"].astype(float) * base_gop).astype(np.float32)
+                if "period" in OUT.columns:
+                    OUT["period"] = OUT["period"].astype(str)
+
+                # merge on normalized keys
+                OUT = OUT.merge(S4b, on=["period","label_key"], how="left")
+
+                # safe fill: treat missing base as 1.0 (i.e., no global up/down-weight)
+                base_dem = OUT.get("dem_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
+                base_gop = OUT.get("gop_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
+
+                if "affinity_cbg_dem" in OUT.columns:
+                    OUT["final_affinity_cbg_dem"] = (OUT["affinity_cbg_dem"].astype(float) * base_dem).astype(np.float32)
+                if "affinity_cbg_gop" in OUT.columns:
+                    OUT["final_affinity_cbg_gop"] = (OUT["affinity_cbg_gop"].astype(float) * base_gop).astype(np.float32)
+
+                # tidy helper
+                OUT.drop(columns=["label_key"], inplace=True, errors="ignore")
         else:
             print(f"[warn] --blend-party-with-s4 set but {s4p} not found; skipping blend.")
+
 
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
