@@ -25,6 +25,8 @@ You can later multiply party tracks by your base Dem/GOP potentials if desired.
 """
 import argparse, re, numpy as np, pandas as pd
 from pathlib import Path
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # feature keys we never project numerically at CBG level
 SKIP_KEYS = {"state"}  # add more if needed, e.g., {"state", "region"}
@@ -125,42 +127,66 @@ def main():
     Z = C[["cbg_id"]].copy()
     for k, col in colmap.items():
         Z[k] = zscore(C[col])
+
     # 4) Build basis weight table keyed by feature_key
     BW = B.set_index("feature_key")[want_cols].fillna(0.0)
 
-    # 5) Compute per (period,label) dot-products → scores per cbg
-    out_rows = []
-    for (period, label), g in S.groupby(["period","label"]):
-        # sparse story weights on the intersecting keys
-        sw = g.set_index("feature_key")["weight"].to_dict()
-        keys = [k for k in colmap.keys() if k in sw]
-        if not keys:
-            continue
-        # vectorize
-        story_w = np.array([float(sw[k]) for k in keys], dtype=float)
-        # matrix of CBG z-features for those keys
-        M = Z[keys].to_numpy(dtype=float)   # (N_cbgs, K)
+    # ----- (Optional) prepare S4 map for per-batch blending -----
+    s4_map = {}
+    if args.blend_party_with_s4 and Path(args.s4).exists():
+        S4 = pd.read_parquet(args.s4)
+        label_candidates = ["label","story_label","winner_label","best_label"]
+        lab_s4 = next((c for c in label_candidates if c in S4.columns), None)
+        if lab_s4 is not None:
+            # normalize period to ISO date string
+            def _norm_period(x):
+                d = pd.to_datetime(x, errors="coerce", utc=False)
+                return d.dt.date.astype("string")
+            S4b = S4.copy()
+            if "period" in S4b.columns:
+                S4b["period"] = _norm_period(S4b["period"])
+            else:
+                S4b["period"] = pd.Series(dtype="string")
+            S4b["label_key"] = S4b[lab_s4].astype(str).apply(norm_key)
+            for c in ["dem_fundraising_potential","gop_fundraising_potential"]:
+                if c in S4b.columns:
+                    S4b[c] = pd.to_numeric(S4b[c], errors="coerce")/100.0
+            # last write wins; build a dict keyed by (period,label_key)
+            for _, r in S4b.iterrows():
+                p = str(r.get("period") or "")
+                lk = str(r.get("label_key") or "")
+                dem = float(r.get("dem_fundraising_potential") or 1.0)
+                gop = float(r.get("gop_fundraising_potential") or 1.0)
+                s4_map[(p, lk)] = (dem, gop)
 
-        for colname in want_cols:
-            basis_w = np.array([float(BW.loc[k, colname]) if k in BW.index else 0.0 for k in keys], dtype=float)
-            # elementwise product per feature → sum across K
-            dots = (M * (story_w * basis_w)).sum(axis=1)  # (N_cbgs,)
-            lift = np.clip(dots, -args.clip, args.clip)
-            score = 1.0 * (1.0 + args.lam * lift)         # base=1.0; can be replaced per-party later
-            out_name = ("affinity_cbg_" + colname.split("_",1)[1]) if colname.startswith("w_") else \
-                    ("affinity_cbg_any" if colname=="p_any" else f"affinity_cbg_{colname}")
-            out_rows.append(pd.DataFrame({
-                "period": period, "label": label, "cbg_id": Z["cbg_id"],
-                out_name: score.astype(np.float32),
-            }))
+    # ----- Prepare a ParquetWriter with a fixed schema -----
+    score_names = []
+    for colname in want_cols:
+        score_names.append(
+            "affinity_cbg_" + colname.split("_",1)[1] if colname.startswith("w_")
+            else ("affinity_cbg_any" if colname=="p_any" else f"affinity_cbg_{colname}")
+        )
 
-    if not out_rows:
-        pd.DataFrame(columns=["period","label","cbg_id"]).to_parquet(args.out, index=False)
-        print(f"✓ wrote {args.out} (empty; no overlapping features)")
-        return
+    fields = [
+        pa.field("period", pa.string()),
+        pa.field("label",  pa.string()),
+        pa.field("cbg_id", pa.string()),
+    ] + [pa.field(n, pa.float32()) for n in score_names]
 
-    # build one wide frame per (period,label), then concat vertically
-    wide_rows = []
+    # add final blended party columns if we might blend
+    blend_party = bool(s4_map)
+    if blend_party:
+        if "affinity_cbg_dem" in score_names:
+            fields.append(pa.field("final_affinity_cbg_dem", pa.float32()))
+        if "affinity_cbg_gop" in score_names:
+            fields.append(pa.field("final_affinity_cbg_gop", pa.float32()))
+
+    schema = pa.schema(fields)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    writer = pq.ParquetWriter(args.out, schema)
+
+    # ----- Stream one (period,label) at a time -----
+    n_batches = 0
     for (period, label), g in S.groupby(["period","label"]):
         sw = g.set_index("feature_key")["weight"].to_dict()
         keys = [k for k in colmap.keys() if k in sw]
@@ -176,6 +202,7 @@ def main():
             "cbg_id": Z["cbg_id"],
         })
 
+        # compute every requested track
         for colname in want_cols:
             basis_w = np.array(
                 [float(BW.loc[k, colname]) if k in BW.index else 0.0 for k in keys],
@@ -185,75 +212,34 @@ def main():
             lift = np.clip(dots, -args.clip, args.clip)
             score = 1.0 * (1.0 + args.lam * lift)
             out_name = (
-                "affinity_cbg_" + colname.split("_", 1)[1] if colname.startswith("w_")
-                else ("affinity_cbg_any" if colname == "p_any" else f"affinity_cbg_{colname}")
+                "affinity_cbg_" + colname.split("_",1)[1] if colname.startswith("w_")
+                else ("affinity_cbg_any" if colname=="p_any" else f"affinity_cbg_{colname}")
             )
             base[out_name] = score.astype(np.float32)
 
-        wide_rows.append(base)
+        # optional S4 blend per batch
+        if blend_party:
+            p_iso = pd.to_datetime(base["period"], errors="coerce").dt.date.astype("string")
+            lk = str(norm_key(label))
+            dem,gop = s4_map.get((p_iso.iloc[0], lk), (1.0, 1.0))
+            if "affinity_cbg_dem" in base.columns:
+                base["final_affinity_cbg_dem"] = (base["affinity_cbg_dem"].astype(float) * float(dem)).astype(np.float32)
+            if "affinity_cbg_gop" in base.columns:
+                base["final_affinity_cbg_gop"] = (base["affinity_cbg_gop"].astype(float) * float(gop)).astype(np.float32)
 
-    if not wide_rows:
-        pd.DataFrame(columns=["period","label","cbg_id"]).to_parquet(args.out, index=False)
-        print(f"✓ wrote {args.out} (empty; no overlapping features)")
-        return
+        # ensure all schema columns present
+        for c in schema.names:
+            if c not in base.columns:
+                base[c] = np.nan
 
-    OUT = pd.concat(wide_rows, ignore_index=True)
+        # order columns and write
+        base = base[schema.names]
+        tbl = pa.Table.from_pandas(base, schema=schema, preserve_index=False)
+        writer.write_table(tbl)
+        n_batches += 1
 
-
-
-    # -------- Optional party blending with S4 base potentials --------
-    if args.blend_party_with_s4:
-        s4p = Path(args.s4)
-        if s4p.exists():
-            S4 = pd.read_parquet(s4p)
-
-            # choose any label-like column present
-            label_candidates = ["label","story_label","winner_label","best_label"]
-            lab_s4 = next((c for c in label_candidates if c in S4.columns), None)
-            if lab_s4 is None:
-                print("[warn] S4 has no label-like column. Skipping blend.")
-            else:
-                # normalize period to ISO (YYYY-MM-DD) on both sides
-                def _norm_period(x):
-                    d = pd.to_datetime(x, errors="coerce", utc=False, infer_datetime_format=True)
-                    return d.dt.date.astype("string")
-
-                OUT["period"] = _norm_period(OUT["period"])
-                S4b = S4.copy()
-                S4b["period"] = _norm_period(S4b["period"]) if "period" in S4b.columns else pd.Series(dtype="string")
-
-                # normalize label keys on both sides
-                OUT["label_key"] = OUT["label"].astype(str).apply(norm_key)
-                S4b["label_key"] = S4b[lab_s4].astype(str).apply(norm_key)
-
-                # scale bases to 0..1
-                keep = ["period","label_key"]
-                for c in ["dem_fundraising_potential","gop_fundraising_potential"]:
-                    if c in S4b.columns:
-                        S4b[c] = pd.to_numeric(S4b[c], errors="coerce")/100.0
-                        keep.append(c)
-
-                S4b = S4b[keep].drop_duplicates(["period","label_key"])
-                OUT = OUT.merge(S4b, on=["period","label_key"], how="left")
-
-                # safe defaults = 1.0 → no reweight
-                base_dem = OUT.get("dem_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
-                base_gop = OUT.get("gop_fundraising_potential", pd.Series(1.0, index=OUT.index)).fillna(1.0)
-                if "affinity_cbg_dem" in OUT.columns:
-                    OUT["final_affinity_cbg_dem"] = (OUT["affinity_cbg_dem"].astype(float) * base_dem).astype(np.float32)
-                if "affinity_cbg_gop" in OUT.columns:
-                    OUT["final_affinity_cbg_gop"] = (OUT["affinity_cbg_gop"].astype(float) * base_gop).astype(np.float32)
-
-                OUT.drop(columns=["label_key"], inplace=True, errors="ignore")
-        else:
-            print(f"[warn] --blend-party-with-s4 set but {s4p} not found; skipping blend.")
-
-
-
-
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    OUT.to_parquet(args.out, index=False)
-    print(f"✓ wrote {args.out} rows={len(OUT)} cols={len(OUT.columns)}")
+    writer.close()
+    print(f"✓ wrote {args.out} (batches={n_batches}, rows≈large)")
 
 if __name__ == "__main__":
     main()
