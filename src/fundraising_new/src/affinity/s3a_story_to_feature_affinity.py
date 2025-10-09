@@ -94,6 +94,22 @@ def main():
     clusters= pd.read_parquet(Path(args.topics_dir)/"clusters.parquet")
     meta    = pd.read_parquet(Path(args.topics_dir)/"cluster_meta.parquet")
 
+    # --- NEW: keep only accepted political/fundraising clusters ---
+    try:
+        S4 = pd.read_parquet("data/topics/political_classification_enriched.parquet")
+        # accept anything that isn’t explicitly non-political; optional: require ≥ some potential
+        S4 = S4[~S4["classification"].fillna("non-political").str.contains("non-political", case=False)]
+        # optional potency gate (uncomment if you want)
+        # S4 = S4[(S4["dem_fundraising_potential"] >= 30) | (S4["gop_fundraising_potential"] >= 30)]
+
+        keep_ids = set(pd.to_numeric(S4["cluster_id"], errors="coerce").dropna().astype(int))
+        meta = meta[meta["cluster_id"].isin(keep_ids)].copy()
+        if meta.empty:
+            print("⚠️ meta restricted to political/fundraising=EMPTY — check S4")
+    except Exception as e:
+        print(f"⚠️ could not apply political filter via S4: {e}")
+
+
     items = items[["item_id","title","source","url","published_at","text"]]
     df = (items.merge(clusters[["item_id","cluster_id","cluster_prob"]], on="item_id", how="inner")
                .merge(meta[["cluster_id","label"]], on="cluster_id", how="left"))
