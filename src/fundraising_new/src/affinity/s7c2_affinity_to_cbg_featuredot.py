@@ -26,9 +26,15 @@ You can later multiply party tracks by your base Dem/GOP potentials if desired.
 import argparse, re, numpy as np, pandas as pd
 from pathlib import Path
 
+# feature keys we never project numerically at CBG level
+SKIP_KEYS = {"state"}  # add more if needed, e.g., {"state", "region"}
+
 def norm_key(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
 
 def best_alias(cols, key):
+    # never project certain keys
+    if key == "state":
+        return None
     aliases = {
         "educ":["pct_bachelors_plus","pct_bachelor_plus"],
         "income":["median_hh_income","median_income","B19013_001E"],
@@ -36,21 +42,27 @@ def best_alias(cols, key):
         "urban_simple":["urban_q","metro_micro","cbsa_cat_num"],
         "home_owner":["owner_occ_rate"],
     }
-    if key in cols: return key
+    if key in cols: 
+        return key
     for cand in aliases.get(key, []):
-        if cand in cols: return cand
-    # fall back to exact alnum match
+        if cand in cols: 
+            return cand
     nk = norm_key(key)
     for c in cols:
-        if norm_key(c) == nk: return c
+        if norm_key(c) == nk: 
+            return c
     return None
+
 
 def zscore(s: pd.Series):
     s = pd.to_numeric(s, errors="coerce")
-    m, sd = s.mean(), s.std(ddof=1)
-    if not np.isfinite(sd) or sd == 0: sd = 1.0
+    m = s.mean(skipna=True)
+    sd = s.std(ddof=1, skipna=True)
+    if not np.isfinite(sd) or sd == 0:
+        sd = 1.0
     out = (s - m) / sd
-    return out.clip(-3,3)
+    return out.clip(-3, 3)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -72,6 +84,11 @@ def main():
     C = pd.read_parquet(args.cbg_features)
     C["cbg_id"] = C["cbg_id"].astype(str)
 
+    # Drop non-projectable categorical features early (e.g., "state")
+    if "feature_key" in S.columns:
+        S["feature_key"] = S["feature_key"].astype(str)
+        S = S[~S["feature_key"].isin(SKIP_KEYS)]
+
     # 2) Which weight columns exist in basis
     want_cols = [c for c in ["w_dem_comb","w_gop_comb","w_cand_comb","w_org_comb","e_size"] if c in B.columns]
     if "p_any" in B.columns:
@@ -81,12 +98,23 @@ def main():
 
     # 3) Prepare a CBG feature matrix for the union of feature_keys appearing in S∩B
     feat_keys = sorted(set(B["feature_key"].astype(str)) & set(S["feature_key"].astype(str)))
+
     colmap = {}
     for k in feat_keys:
+        if k in SKIP_KEYS:
+            continue
         col = best_alias(C.columns, k)
-        if col: colmap[k] = col
+        if not col:
+            continue
+        # must be numeric-convertible and have at least a couple of non-nulls
+        s = pd.to_numeric(C[col], errors="coerce")
+        if s.notna().sum() < 2:
+            continue
+        colmap[k] = col
+
     if not colmap:
         raise SystemExit("No story/basis features map to CBG columns. Extend alias map.")
+
 
     Z = C[["cbg_id"]].copy()
     for k, col in colmap.items():
