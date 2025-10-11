@@ -115,11 +115,16 @@ def main():
 
         # merge standardized topics; fallback to label when missing
         if not m.empty:
-            d2 = df_labels.merge(m, on="label_key", how="left")
+            # after merging label_key -> standardized_topic_names into d2
             d2["std_topic"] = d2["standardized_topic_names"].where(
                 d2["standardized_topic_names"].notna(),
-                df_labels["label"].astype(str)
+                d2["label"].astype(str)            # fallback to raw label
             )
+            d2 = d2.assign(topic=d2["std_topic"].astype(str)
+                                        .str.split(r"\s*;\s*|\s*\|\s*|,\s*")).explode("topic")
+            d2["topic"] = d2["topic"].astype(str).str.strip()
+            d2 = d2[(d2["topic"] != "") & (d2["topic"].str.lower() != "nan")]
+
         else:
             d2 = df_labels.copy()
             d2["std_topic"] = d2["label"].astype(str)
