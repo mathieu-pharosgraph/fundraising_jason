@@ -75,6 +75,10 @@ def score_name(colname: str) -> str:
     # fallback (shouldn’t trigger in our set)
     return f"affinity_cbg_{colname}"
 
+def _norm_key(s: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+","", str(s).lower())
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--story-features", required=True)
@@ -189,8 +193,10 @@ def main():
     fields = [
         pa.field("period", pa.string()),
         pa.field("label",  pa.string()),
+        pa.field("label_key", pa.string()),    # NEW
         pa.field("cbg_id", pa.string()),
     ] + [pa.field(n, pa.float32()) for n in score_names]
+
 
     # add final blended party columns if we might blend
     blend_party = bool(s4_map)
@@ -218,8 +224,10 @@ def main():
         base = pd.DataFrame({
             "period": str(period),
             "label":  str(label),
+            "label_key": _norm_key(label),   # NEW
             "cbg_id": Z["cbg_id"],
         })
+
 
         # compute every requested track
         for colname in want_cols:
