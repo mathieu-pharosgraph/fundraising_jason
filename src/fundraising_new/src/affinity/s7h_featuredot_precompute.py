@@ -104,39 +104,67 @@ def main():
     if org_col:  _winners(fd, org_col,  periods, pol_keys).to_parquet(outdir/"best_per_cbg_Org.parquet", index=False)
     if size_col: _winners(fd, size_col, periods, pol_keys).to_parquet(outdir/"best_per_cbg_Size.parquet", index=False)
 
-    # timeline with track marker (party only here)
-    m = _topic_map(args.enriched)
+    # ---- build timeline for whatever tracks exist ----
+    m = _topic_map(args.enriched)  # label_key -> standardized_topic_names
     tl_rows = []
-    for party, col in [("Dem", dem_col), ("GOP", gop_col)]:
+
+    def _explode_and_sum(df_labels: pd.DataFrame, col: str, party: str | None, track: str):
+        if df_labels.empty:
+            return None
+        df_labels["label_key"] = df_labels["label"].astype(str).map(_norm_key)
+
+        # merge standardized topics; fallback to label when missing
+        if not m.empty:
+            d2 = df_labels.merge(m, on="label_key", how="left")
+            d2["std_topic"] = d2["standardized_topic_names"].where(
+                d2["standardized_topic_names"].notna(),
+                df_labels["label"].astype(str)
+            )
+        else:
+            d2 = df_labels.copy()
+            d2["std_topic"] = d2["label"].astype(str)
+
+        # explode to single topics; sanitize 'nan'
+        d2 = d2.assign(topic=d2["std_topic"].astype(str).str.split(r"\s*;\s*|\s*\|\s*|,\s*")).explode("topic", ignore_index=True)
+        d2["topic"] = d2["topic"].astype(str).str.strip()
+        d2 = d2[(d2["topic"] != "") & (d2["topic"].str.lower() != "nan")]
+
+        d2["affinity_sum"] = pd.to_numeric(d2[col], errors="coerce").fillna(0.0)
+        g = (d2.groupby(["period","topic"], as_index=False)["affinity_sum"].sum()
+            .assign(track=track))
+        if party is not None:
+            g["party"] = party
+        return g[["period","topic","track","party","affinity_sum"]] if "party" in g.columns else g[["period","topic","track","affinity_sum"]]
+
+    tracks = []  # (track_name, party_or_None, column_name)
+    if dem_col:  tracks.append(("party", "Dem", dem_col))
+    if gop_col:  tracks.append(("party", "GOP", gop_col))
+    if any_col:  tracks.append(("any",   None, any_col))
+    if cand_col: tracks.append(("cand",  None, cand_col))
+    if org_col:  tracks.append(("org",   None, org_col))
+    if size_col: tracks.append(("size",  None, size_col))
+
+    for track, party, col in tracks:
         for p in periods:
             tbl = fd.to_table(columns=["period","label",col], filter=(ds.field("period")==p))
             df = tbl.to_pandas()
             if df.empty: 
                 continue
-            # NEW: apply political filter here too
+            # apply political filter to labels if any
             if pol_keys:
                 lk = df["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
                 df = df[lk.isin(pol_keys)].copy()
                 if df.empty:
                     continue
+            g = _explode_and_sum(df, col, party, track)
+            if g is not None and not g.empty:
+                tl_rows.append(g)
 
-            df["label_key"] = df["label"].astype(str).map(_norm_key)
-            if not m.empty:
-                d2 = df.merge(m, on="label_key", how="left")
-                d2 = _explode_topics(d2)
-                d2["aff_sum"] = pd.to_numeric(d2[col], errors="coerce").fillna(0.0)
-                g = (d2.groupby(["period","std_topic"], as_index=False)["aff_sum"].sum()
-                    .assign(party=party, track="party")
-                    .rename(columns={"aff_sum":"affinity_sum"}))
-            else:
-                df["std_topic"] = df["label"].astype(str)
-                df["affinity_sum"] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-                g = df.groupby(["period","std_topic"], as_index=False)["affinity_sum"].sum()
-                g["party"] = party; g["track"] = "party"
-            tl_rows.append(g[["period","std_topic","party","track","affinity_sum"]])
-
-    tl = pd.concat(tl_rows, ignore_index=True) if tl_rows else pd.DataFrame(columns=["period","std_topic","party","track","affinity_sum"])
+    tl_cols = ["period","topic","track","party","affinity_sum"]
+    tl = pd.concat(tl_rows, ignore_index=True)[tl_cols] if tl_rows else pd.DataFrame(columns=tl_cols)
+    tl = tl.rename(columns={"topic":"std_topic"})
     tl.to_parquet(outdir/"topic_timeline.parquet", index=False)
-    print("✓ precompute complete.")
+    print("✓ precompute complete (timeline rows:", len(tl), ")")
+
 if __name__ == "__main__":
     main()
