@@ -78,6 +78,11 @@ def main():
                 help="Keep labels where max(dem,gop) >= this (0-100); 0 disables the threshold")
     args = ap.parse_args()
 
+    # label_key -> standardized_topic_names, produced in step 2
+    MAP_PATH = args.enriched  # pass the new file path when running
+    m = pd.read_csv(MAP_PATH, dtype=str, low_memory=False)[["label_key","standardized_topic_names"]].drop_duplicates("label_key")
+
+
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
     pol_keys = _political_label_keys(args.s4, args.min_potential)
     fd = ds.dataset(args.featuredot, format="parquet")
@@ -105,40 +110,45 @@ def main():
     if size_col: _winners(fd, size_col, periods, pol_keys).to_parquet(outdir/"best_per_cbg_Size.parquet", index=False)
 
     # ---- build timeline for whatever tracks exist ----
-    m = _topic_map(args.enriched)  # label_key -> standardized_topic_names
     tl_rows = []
 
-    def _explode_and_sum(df_labels: pd.DataFrame, col: str, party: str | None, track: str):
+    def _explode_and_sum(df_labels: pd.DataFrame, col: str, party: str | None, track: str, m: pd.DataFrame) -> pd.DataFrame | None:
+        """
+        df_labels: ['period','label','label_key', <col>]
+        col      : affinity column to aggregate
+        party    : 'Dem'|'GOP' or None
+        track    : 'party'|'any'|'cand'|'org'|'size'
+        m        : ['label_key','standardized_topic_names']
+        """
         if df_labels.empty:
             return None
-        df_labels["label_key"] = df_labels["label"].astype(str).map(_norm_key)
 
-        # merge standardized topics; fallback to label when missing
-        if not m.empty:
-            # after merging label_key -> standardized_topic_names into d2
+        d2 = df_labels.copy()
+
+        # Merge standardized topics on label_key, fallback to raw label text
+        if m is not None and not m.empty:
+            d2 = d2.merge(m, on="label_key", how="left")
             d2["std_topic"] = d2["standardized_topic_names"].where(
                 d2["standardized_topic_names"].notna(),
-                d2["label"].astype(str)            # fallback to raw label
+                d2["label"].astype(str)
             )
-            d2 = d2.assign(topic=d2["std_topic"].astype(str)
-                                        .str.split(r"\s*;\s*|\s*\|\s*|,\s*")).explode("topic")
-            d2["topic"] = d2["topic"].astype(str).str.strip()
-            d2 = d2[(d2["topic"] != "") & (d2["topic"].str.lower() != "nan")]
-
         else:
-            d2 = df_labels.copy()
             d2["std_topic"] = d2["label"].astype(str)
 
-        # explode to single topics; sanitize 'nan'
-        d2 = d2.assign(topic=d2["std_topic"].astype(str).str.split(r"\s*;\s*|\s*\|\s*|,\s*")).explode("topic", ignore_index=True)
+        # Explode to single topics and sanitize
+        d2 = d2.assign(topic=d2["std_topic"].astype(str)
+                                .str.split(r"\s*;\s*|\s*\|\s*|,\s*")).explode("topic", ignore_index=True)
         d2["topic"] = d2["topic"].astype(str).str.strip()
         d2 = d2[(d2["topic"] != "") & (d2["topic"].str.lower() != "nan")]
 
+        # Numeric coercion + aggregation
         d2["affinity_sum"] = pd.to_numeric(d2[col], errors="coerce").fillna(0.0)
         g = (d2.groupby(["period","topic"], as_index=False)["affinity_sum"].sum()
             .assign(track=track))
+
         if party is not None:
             g["party"] = party
+
         return g[["period","topic","track","party","affinity_sum"]] if "party" in g.columns else g[["period","topic","track","affinity_sum"]]
 
     tracks = []  # (track_name, party_or_None, column_name)
@@ -151,19 +161,27 @@ def main():
 
     for track, party, col in tracks:
         for p in periods:
-            tbl = fd.to_table(columns=["period","label",col], filter=(ds.field("period")==p))
+            have_lk = "label_key" in fd.schema.names
+            cols_to_read = ["period","label","label_key",col] if have_lk else ["period","label",col]
+            tbl = fd.to_table(columns=[c for c in cols_to_read if c in fd.schema.names],
+                            filter=(ds.field("period")==p))
             df = tbl.to_pandas()
-            if df.empty: 
+            if df.empty:
                 continue
-            # apply political filter to labels if any
+
+            if "label_key" not in df.columns:
+                df["label_key"] = df["label"].astype(str).map(_norm_key)
+
+            # political filter (use label_key — consistent with S4)
             if pol_keys:
-                lk = df["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
-                df = df[lk.isin(pol_keys)].copy()
+                df = df[df["label_key"].isin(pol_keys)].copy()
                 if df.empty:
                     continue
-            g = _explode_and_sum(df, col, party, track)
+
+            g = _explode_and_sum(df, col, party, track, m)
             if g is not None and not g.empty:
                 tl_rows.append(g)
+
 
     tl_cols = ["period","topic","track","party","affinity_sum"]
     tl = pd.concat(tl_rows, ignore_index=True)[tl_cols] if tl_rows else pd.DataFrame(columns=tl_cols)
