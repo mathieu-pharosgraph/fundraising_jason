@@ -143,17 +143,23 @@ def main():
     agg["standardized_topic_names"] = agg["topic_ids"].apply(lambda lst: "; ".join(lst) if lst else "")
     agg = agg[["label_key","standardized_topic_names"]]
 
-    # 3) Left-join to every label_key in feature-dot; fallback to raw label when empty
+    # 3) Left-join to every label_key in feature-dot; fallback to raw label when missing
     out = fd.merge(agg, on="label_key", how="left")
-    out["standardized_topic_names"] = out["standardized_topic_names"].where(
-        out["standardized_topic_names"].astype(str).str.strip() != "",
-        out["fallback_label"].astype(str)
-    )
+
+    def _fallback(val, fb):
+        # treat None/NaN/"nan"/"" as missing
+        if val is None:
+            return fb
+        s = str(val).strip()
+        if s == "" or s.lower() == "nan":
+            return fb
+        return s
+
+    out["standardized_topic_names"] = [
+        _fallback(val, fb) for val, fb in zip(out.get("standardized_topic_names"), out["fallback_label"])
+    ]
     out = out[["label_key","standardized_topic_names"]].drop_duplicates("label_key")
 
-    Path(OUT_CSV).parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(OUT_CSV, index=False)
-    print(f"✓ wrote {OUT_CSV} rows={len(out)}")
 
 if __name__ == "__main__":
     main()
