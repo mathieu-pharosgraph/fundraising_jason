@@ -135,11 +135,32 @@ def main():
         else:
             d2["std_topic"] = d2["label"].astype(str)
 
-        # Explode to single topics and sanitize
-        d2 = d2.assign(topic=d2["std_topic"].astype(str)
-                                .str.split(r"\s*;\s*|\s*\|\s*|,\s*")).explode("topic", ignore_index=True)
-        d2["topic"] = d2["topic"].astype(str).str.strip()
+        CANON = set([
+        "Non-Political / Other","Abortion & Reproductive Rights","Immigration Policy & Enforcement",
+        "Trump Administration & Policy Agenda","Election Integrity & Voting Rights",
+        "Healthcare Policy (ACA, Medicare, Medicaid)","Supreme Court & Judicial Affairs",
+        "Gun Policy & Violence","LGBTQ+ Rights","Economic Policy & indicators",
+        "Student Debt & Loan Forgiveness","Vaccines & Public Health",
+        "Climate Change & Environmental Policy","Foreign Policy & National Security",
+        "Ukraine-Russia War","Israel-Palestine Conflict","Civil Liberties & Free Speech",
+        "Law Enforcement & Policing","Congressional Dynamics & Legislation",
+        "Corporate Accountability & Business","Technology & AI Regulation",
+        "Labor & Workers' Rights","Education Policy","Social Security & Welfare Programs",
+        "Media & Journalism","Entertainment & Culture","Ethics & Corruption Scandals",
+        "Extremism & Domestic Threats","Censorship & Misinformation",
+        "Federal Agency Oversight","State vs. Federal Power","Refugee & Asylum Seeker Crisis",
+        "International Human Rights","Campaign Finance & Politics",
+        "Historical Legacy & Commemoration","Crime & Public Safety","Housing and Affordability",
+        "Opioid Crisis & Substance Abuse","Taxation & Fiscal Policy",
+        ])
+
+        # explode
+        d2 = d2.assign(topic=d2["std_topic"].astype(str).str.split(r"\s*;\s*")).explode("topic", ignore_index=True)
+        d2["topic"] = d2["topic"].astype(str).strip()
         d2 = d2[(d2["topic"] != "") & (d2["topic"].str.lower() != "nan")]
+
+        # mark whether topic is canonical; if not, we’ll keep it only if the UI asks for story labels
+        d2["is_canonical"] = d2["topic"].isin(CANON)
 
         # Numeric coercion + aggregation
         d2["affinity_sum"] = pd.to_numeric(d2[col], errors="coerce").fillna(0.0)
