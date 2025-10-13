@@ -54,9 +54,16 @@ import hdbscan
 
 # ---------- LLM (DeepSeek) ----------
 import requests as rq
+import hashlib
+
+
 
 # =============== helpers ===============
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+SNAP_DIR = Path("data/topics/snapshots")
+SNAP_DIR.mkdir(parents=True, exist_ok=True)
+SNAP_MANIFEST = SNAP_DIR / "_manifest.csv"
 
 def load_items(glob_pat: str) -> pd.DataFrame:
     rows = []
@@ -160,6 +167,111 @@ def embed_texts(texts: List[str], backend="sentence-transformers",
         model = SentenceTransformer(model_name)
         emb = model.encode(texts, batch_size=batch, show_progress_bar=True, normalize_embeddings=True)
         return emb.astype(np.float32)
+
+def _nkey(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+","", str(s).lower())
+
+def _hash_list(xs) -> str:
+    b = json.dumps(sorted(list(xs)), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(b).hexdigest()[:16]
+
+def _load_manifest() -> pd.DataFrame:
+    if SNAP_MANIFEST.exists():
+        try:
+            return pd.read_csv(SNAP_MANIFEST, dtype=str)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["day","n_clusters","items_hash","written_at"])
+
+def _save_manifest_row(day: str, n_clusters: int, items_hash: str):
+    mf = _load_manifest()
+    row = {"day": day, "n_clusters": str(n_clusters),
+           "items_hash": items_hash, "written_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    # upsert by (day, items_hash) — keep the last record
+    mf = pd.concat([mf, pd.DataFrame([row])], ignore_index=True)
+    mf = (mf.sort_values("written_at")
+            .drop_duplicates(["day"], keep="last"))
+    mf.to_csv(SNAP_MANIFEST, index=False)
+
+def _date_str(ts):
+    if pd.isna(ts): return None
+    return pd.to_datetime(ts).date().isoformat()
+
+def _ensure_dir(p):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def _collect_rep_titles(items_for_cluster: pd.DataFrame, k=5) -> str:
+    g = (items_for_cluster
+         .sort_values(["cluster_prob","published_at"], ascending=[False, True])
+         .head(k))
+    titles = [str(t)[:140] for t in g["title"].fillna("").tolist() if str(t).strip()]
+    return " | ".join(titles)
+
+def build_daily_snapshot(day: str,
+                         items: pd.DataFrame,
+                         clusters: pd.DataFrame,
+                         meta: pd.DataFrame,
+                         std_topics: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Return one row per (cluster) that has >=1 item on `day` AND is accepted by meta gates.
+    Columns are stable for apps.
+    """
+    # items on this day
+    it = items.copy()
+    it["published_at"] = pd.to_datetime(it["published_at"], errors="coerce", utc=True)
+    it["day"] = it["published_at"].dt.date.astype(str)
+    it = it[it["day"] == str(day)]
+
+    if it.empty:
+        return it.iloc[0:0]
+
+    # join cluster_id + meta acceptance
+    tall = (it.merge(clusters[["item_id","cluster_id","cluster_prob"]],
+                     on="item_id", how="inner")
+              .merge(meta, on="cluster_id", how="left"))
+
+    # accepted gates (match your topics_build acceptance)
+    acc = tall[(tall["us_relevance"]) &
+               (tall["fundraising_usable"]) &
+               (pd.to_numeric(tall["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
+
+    if acc.empty:
+        return acc.iloc[0:0]
+
+    # attach standardized topics if provided (from s5)
+    if std_topics is not None and not std_topics.empty:
+        acc = acc.merge(std_topics[["cluster_id","standardized_topic_names"]],
+                        on="cluster_id", how="left")
+    else:
+        acc["standardized_topic_names"] = ""
+
+    # per-cluster aggregation for the day
+    def agg_cluster(g):
+        rid = g["cluster_id"].iloc[0]
+        rep_ids = (g.sort_values(["cluster_prob","published_at"], ascending=[False, True])["item_id"]
+                    .dropna().astype(str).head(5).tolist())
+
+        return pd.Series({
+            "cluster_id": int(rid),
+            "label": str(g.get("label", "").iloc[0]) if "label" in g.columns else "",
+            "standardized_topic_names": str(g.get("standardized_topic_names", "").iloc[0]),
+            "us_relevance": bool(g["us_relevance"].max()),
+            "fundraising_usable": bool(g["fundraising_usable"].max()),
+            "fundraising_score": float(pd.to_numeric(g["fundraising_score"], errors="coerce").max()),
+            "party_lean": str(g.get("party_lean", "").iloc[0]),
+            "n_items": int(g["item_id"].nunique()),
+            "first_date": str(pd.to_datetime(g["published_at"]).dt.date.min()),
+            "last_date":  str(pd.to_datetime(g["published_at"]).dt.date.max()),
+            "rep_titles": _collect_rep_titles(g),
+            "rep_item_ids": json.dumps(rep_ids, ensure_ascii=False)
+        })
+
+    snap = (acc.groupby("cluster_id", as_index=False)
+              .apply(agg_cluster)
+              .reset_index(drop=True))
+
+    snap.insert(0, "day", str(day))
+    return snap
 
 # ---------- clustering ----------
 def cluster_embeddings(X: np.ndarray, min_cluster_size=12, min_samples=None,
@@ -392,6 +504,15 @@ def main():
     ap.add_argument("--sbert-model", default="sentence-transformers/all-mpnet-base-v2")
     ap.add_argument("--min-cluster-size", type=int, default=8)
     ap.add_argument("--max-items", type=int, default=20000)
+    ap.add_argument("--write-snapshots", action="store_true",
+                help="Write append-only daily snapshots of accepted clusters.")
+    ap.add_argument("--snapshot-start", default=None,
+                    help="YYYY-MM-DD; if set, write snapshots for days >= this.")
+    ap.add_argument("--snapshot-end", default=None,
+                    help="YYYY-MM-DD; if set, write snapshots for days <= this.")
+    ap.add_argument("--snapshot-force", action="store_true",
+                    help="Overwrite an existing daily snapshot if present (default: skip).")
+
     args = ap.parse_args()
 
     outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
@@ -432,6 +553,10 @@ def main():
     df["cluster_prob"] = probs
     df.to_parquet(outdir / "clusters.parquet", index=False)
 
+    # Build tidy frames for snapshot use
+    items_df = df[["item_id","title","source","url","published_at"]].copy()
+    clusters_df = df[["item_id","cluster_id","cluster_prob"]].copy()
+
     reps = cluster_representatives(df, X, labels, top_k=5)
     # build cluster snippets for LLM
     meta_rows = []
@@ -470,6 +595,110 @@ def main():
         .groupby(["day","label"], as_index=False)
         .agg(items=("item_id","count")))
     topic_events.to_parquet(outdir / "topic_events.parquet", index=False)
+
+    # Optional standardized topics from s5 (to carry into snapshots)
+    S5_PATH = Path("data/topics/merged_data_with_topics.parquet")
+    std_topics = pd.DataFrame()
+    if S5_PATH.exists():
+        s5 = pd.read_parquet(S5_PATH)
+        keep = [c for c in ["cluster_id","standardized_topic_ids","standardized_topic_names"] if c in s5.columns]
+        if keep:
+            s5 = s5[keep].drop_duplicates("cluster_id")
+            # prefer names if already present; else leave as-is
+            if "standardized_topic_names" in s5.columns:
+                s5["standardized_topic_names"] = s5["standardized_topic_names"].astype(str)
+            std_topics = s5[["cluster_id","standardized_topic_names"]]
+
+
+    # -------------------- DAILY SNAPSHOT(S) (append-only) --------------------
+    if args.write_snapshots:
+        snap_dir = SNAP_DIR
+        _ensure_dir(snap_dir)
+
+        # days present in items
+        all_days = (pd.to_datetime(items_df["published_at"], errors="coerce", utc=True)
+                    .dt.date.dropna().astype(str).sort_values().unique().tolist())
+
+        if not all_days:
+            print("[snapshot] no dates found in items — skipping")
+        else:
+            # restrict to window if provided
+            if args.snapshot_start:
+                all_days = [d for d in all_days if d >= args.snapshot_start]
+            if args.snapshot_end:
+                all_days = [d for d in all_days if d <= args.snapshot_end]
+
+            for snap_date in all_days:
+                out_path = snap_dir / f"{snap_date}_clusters.parquet"
+                if out_path.exists() and not args.snapshot_force:
+                    print(f"[snapshot] exists, skip: {out_path}")
+                    continue
+
+                # accepted clusters
+                accepted = meta[(meta["us_relevance"]) &
+                                (meta["fundraising_usable"]) &
+                                (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
+                if accepted.empty:
+                    print(f"[snapshot] no accepted clusters on {snap_date}")
+                    continue
+
+                # items on that day
+                it = items_df.copy()
+                it["day"] = pd.to_datetime(it["published_at"], errors="coerce", utc=True).dt.date.astype(str)
+                it = it[it["day"] == snap_date]
+                if it.empty:
+                    print(f"[snapshot] no items on {snap_date}")
+                    continue
+
+                # active clusters that day
+                act = (it.merge(clusters_df, on="item_id", how="inner")
+                        [["cluster_id","item_id","cluster_prob"]]
+                        .drop_duplicates("item_id"))
+
+                acc_act = accepted.merge(act[["cluster_id"]].drop_duplicates(), on="cluster_id", how="inner")
+                if acc_act.empty:
+                    print(f"[snapshot] no accepted clusters active on {snap_date}")
+                    continue
+
+                # rep titles
+                joined = (it.merge(clusters_df, on="item_id", how="inner")
+                            .merge(acc_act[["cluster_id","label","party_lean","fundraising_score","rationale"]],
+                                on="cluster_id", how="inner"))
+
+                rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
+                            .groupby("cluster_id")["title"]
+                            .apply(lambda s: " | ".join([str(t)[:140] for t in s.head(5) if str(t).strip()]))
+                            .reset_index(name="rep_titles_day"))
+
+                # assemble snapshot
+                snap = (acc_act.merge(rep, on="cluster_id", how="left")
+                            .assign(snapshot_date=snap_date)
+                            [["snapshot_date","cluster_id","label","party_lean",
+                                "fundraising_score","rep_titles_day","rationale"]])
+
+                # add label_key (richer schema for app filtering)
+                snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
+
+                # attach standardized topics if we have them
+                if not std_topics.empty:
+                    snap = snap.merge(std_topics, on="cluster_id", how="left")
+
+                snap.to_parquet(out_path, index=False)
+                print(f"[snapshot] wrote {out_path} rows={len(snap)}")
+
+            # update manifest after writing all days
+            rows = []
+            for p in sorted(snap_dir.glob("*_clusters.parquet")):
+                d = p.stem.split("_clusters")[0]
+                try:
+                    n = len(pd.read_parquet(p))
+                except Exception:
+                    n = 0
+                rows.append({"snapshot_date": d, "path": str(p), "n_clusters": str(n)})
+            man = pd.DataFrame(rows).sort_values("snapshot_date")
+            man.to_csv(snap_dir / "_manifest.csv", index=False)
+            print(f"[snapshot] updated {snap_dir / '_manifest.csv'} with {len(man)} days")
+
 
     print(f"✓ wrote {outdir/'topic_events.parquet'} rows={len(topic_events)}")
 
