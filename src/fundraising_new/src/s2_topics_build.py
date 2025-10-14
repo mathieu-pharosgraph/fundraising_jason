@@ -65,6 +65,8 @@ SNAP_DIR = Path("data/topics/snapshots")
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 SNAP_MANIFEST = SNAP_DIR / "_manifest.csv"
 
+SNAP_DIR = Path("data/topics/snapshots")
+
 def load_items(glob_pat: str) -> pd.DataFrame:
     rows = []
     for p in sorted(Path().glob(glob_pat)):
@@ -634,47 +636,46 @@ def main():
                     print(f"[snapshot] exists, skip: {out_path}")
                     continue
 
-                # accepted clusters
-                accepted = meta[(meta["us_relevance"]) &
-                                (meta["fundraising_usable"]) &
-                                (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
-                if accepted.empty:
-                    print(f"[snapshot] no accepted clusters on {snap_date}")
-                    continue
+                # ---- pick the meta set for each snapshot flavor ----
+                meta_all = meta.copy()
+                meta_accepted = meta[(meta["us_relevance"]) &
+                                    (meta["fundraising_usable"]) &
+                                    (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
 
-                # items on that day
-                it = items_df.copy()
-                it["day"] = pd.to_datetime(it["published_at"], errors="coerce", utc=True).dt.date.astype(str)
-                it = it[it["day"] == snap_date]
-                if it.empty:
-                    print(f"[snapshot] no items on {snap_date}")
-                    continue
-
-                # active clusters that day
-                act = (it.merge(clusters_df, on="item_id", how="inner")
-                        [["cluster_id","item_id","cluster_prob"]]
-                        .drop_duplicates("item_id"))
-
-                acc_act = accepted.merge(act[["cluster_id"]].drop_duplicates(), on="cluster_id", how="inner")
-                if acc_act.empty:
-                    print(f"[snapshot] no accepted clusters active on {snap_date}")
-                    continue
-
-                # rep titles
-                joined = (it.merge(clusters_df, on="item_id", how="inner")
-                            .merge(acc_act[["cluster_id","label","party_lean","fundraising_score","rationale"]],
-                                on="cluster_id", how="inner"))
-
-                rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
+                def _write_snap(meta_set: pd.DataFrame, suffix: str):
+                    if meta_set.empty:
+                        print(f"[snapshot{suffix}] no clusters in meta set on {snap_date}")
+                        return
+                    # active clusters that day
+                    act = (it.merge(clusters_df, on="item_id", how="inner")
+                            [["cluster_id","item_id","cluster_prob"]]
+                            .drop_duplicates("item_id"))
+                    meta_act = meta_set.merge(act[["cluster_id"]].drop_duplicates(), on="cluster_id", how="inner")
+                    if meta_act.empty:
+                        print(f"[snapshot{suffix}] no clusters active on {snap_date}")
+                        return
+                    joined = (it.merge(clusters_df, on="item_id", how="inner")
+                                .merge(meta_act[["cluster_id","label","party_lean","fundraising_score","rationale"]],
+                                    on="cluster_id", how="inner"))
+                    rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
                             .groupby("cluster_id")["title"]
                             .apply(lambda s: " | ".join([str(t)[:140] for t in s.head(5) if str(t).strip()]))
                             .reset_index(name="rep_titles_day"))
-
-                # assemble snapshot
-                snap = (acc_act.merge(rep, on="cluster_id", how="left")
+                    snap = (meta_act.merge(rep, on="cluster_id", how="left")
                             .assign(snapshot_date=snap_date)
                             [["snapshot_date","cluster_id","label","party_lean",
                                 "fundraising_score","rep_titles_day","rationale"]])
+                    snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
+                    if not std_topics.empty:
+                        snap = snap.merge(std_topics, on="cluster_id", how="left")
+                    out_path = snap_dir / f"{snap_date}_clusters{suffix}.parquet"
+                    snap.to_parquet(out_path, index=False)
+                    print(f"[snapshot{suffix}] wrote {out_path} rows={len(snap)}")
+
+                # write both: strict and all
+                _write_snap(meta_accepted, "")         # existing strict file
+                _write_snap(meta_all, "_all")          # new 'all' snapshot
+
 
                 # add label_key (richer schema for app filtering)
                 snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
