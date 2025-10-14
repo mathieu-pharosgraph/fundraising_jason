@@ -422,7 +422,7 @@ def main():
 
                 # normalize roles (you already do)
                 roles = normalize_roles(res.get("roles"))
-                ...
+
                 # normalize CTA (NEW)
                 cta_norm = _normalize_cta(res.get("cta", {}))
 
