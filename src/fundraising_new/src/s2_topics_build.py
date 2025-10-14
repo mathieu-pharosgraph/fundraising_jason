@@ -632,49 +632,69 @@ def main():
 
             for snap_date in all_days:
                 out_path = snap_dir / f"{snap_date}_clusters.parquet"
-                if out_path.exists() and not args.snapshot_force:
-                    print(f"[snapshot] exists, skip: {out_path}")
+                out_all  = snap_dir / f"{snap_date}_clusters_all.parquet"
+
+                if (out_path.exists() or out_all.exists()) and not args.snapshot_force:
+                    print(f"[snapshot] exists (strict or all), skip: {snap_date}")
                     continue
 
-                # ---- pick the meta set for each snapshot flavor ----
-                meta_all = meta.copy()
-                meta_accepted = meta[(meta["us_relevance"]) &
-                                    (meta["fundraising_usable"]) &
-                                    (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
+                # items on that day
+                it = items_df.copy()
+                it["day"] = pd.to_datetime(it["published_at"], errors="coerce", utc=True).dt.date.astype(str)
+                it = it[it["day"] == snap_date]
+                if it.empty:
+                    print(f"[snapshot] no items on {snap_date}")
+                    continue
 
                 def _write_snap(meta_set: pd.DataFrame, suffix: str):
+                    """Write one snapshot file for this day using the given meta set."""
                     if meta_set.empty:
                         print(f"[snapshot{suffix}] no clusters in meta set on {snap_date}")
                         return
+
                     # active clusters that day
                     act = (it.merge(clusters_df, on="item_id", how="inner")
                             [["cluster_id","item_id","cluster_prob"]]
                             .drop_duplicates("item_id"))
+
                     meta_act = meta_set.merge(act[["cluster_id"]].drop_duplicates(), on="cluster_id", how="inner")
                     if meta_act.empty:
                         print(f"[snapshot{suffix}] no clusters active on {snap_date}")
                         return
+
                     joined = (it.merge(clusters_df, on="item_id", how="inner")
                                 .merge(meta_act[["cluster_id","label","party_lean","fundraising_score","rationale"]],
                                     on="cluster_id", how="inner"))
+
                     rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
                             .groupby("cluster_id")["title"]
                             .apply(lambda s: " | ".join([str(t)[:140] for t in s.head(5) if str(t).strip()]))
                             .reset_index(name="rep_titles_day"))
+
                     snap = (meta_act.merge(rep, on="cluster_id", how="left")
                             .assign(snapshot_date=snap_date)
                             [["snapshot_date","cluster_id","label","party_lean",
                                 "fundraising_score","rep_titles_day","rationale"]])
+
+                    # label_key + topics (if available)
                     snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
                     if not std_topics.empty:
                         snap = snap.merge(std_topics, on="cluster_id", how="left")
-                    out_path = snap_dir / f"{snap_date}_clusters{suffix}.parquet"
-                    snap.to_parquet(out_path, index=False)
-                    print(f"[snapshot{suffix}] wrote {out_path} rows={len(snap)}")
 
-                # write both: strict and all
-                _write_snap(meta_accepted, "")         # existing strict file
-                _write_snap(meta_all, "_all")          # new 'all' snapshot
+                    out_file = snap_dir / f"{snap_date}_clusters{suffix}.parquet"
+                    snap.to_parquet(out_file, index=False)
+                    print(f"[snapshot{suffix}] wrote {out_file} rows={len(snap)}")
+
+                # meta sets
+                meta_accepted = meta[(meta["us_relevance"]) &
+                                    (meta["fundraising_usable"]) &
+                                    (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
+                meta_all = meta.copy()
+
+                # write both snapshots
+                _write_snap(meta_accepted, "")     # strict (existing)
+                _write_snap(meta_all, "_all")      # new all-clusters snapshot
+
 
 
                 # add label_key (richer schema for app filtering)
