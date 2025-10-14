@@ -286,6 +286,49 @@ def save_metrics(out_dir: Path, rows: List[Dict[str, Any]]):
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
+    """Flatten emotions/moral/cta/roles from topic_metrics.parquet to a per-(period,label_key) CSV."""
+    def _nkey(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
+
+    if not metrics_parquet.exists():
+        print(f"[spiders] metrics parquet missing: {metrics_parquet}"); return
+
+    df = pd.read_parquet(metrics_parquet)
+    # expected: cluster_id, label, period, emotions, moral_foundations, cta, roles
+    df["period_norm"] = pd.to_datetime(df.get("period",""), errors="coerce").dt.date.astype("string")
+    df["label_key"]   = df.get("label","").astype(str).apply(_nkey)
+
+    def _to_obj(x):
+        if isinstance(x, dict): return x
+        s = str(x or "").strip()
+        if not s: return {}
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                o = parser(s); return o if isinstance(o, dict) else {}
+            except Exception: pass
+        return {}
+
+    emo  = pd.json_normalize(df["emotions"].map(_to_obj)).add_prefix("emo_")
+    mf   = pd.json_normalize(df["moral_foundations"].map(_to_obj)).add_prefix("mf_")
+    cta  = pd.json_normalize(df["cta"].map(_to_obj)).add_prefix("cta_")
+    roles= pd.json_normalize(df["roles"].map(_to_obj))[["heroes","villains","victims","antiheroes"]]
+
+    tall = pd.concat([df[["period_norm","label_key"]], emo, mf, cta, roles], axis=1)
+    # aggregate by (period,label_key): means for numeric; first non-null for text/list-ish
+    num_cols = [c for c in tall.columns if c.startswith(("emo_","mf_","cta_ask_strength"))]
+
+    def _first_nonempty(series):
+        s = series.dropna()
+        return s.iloc[0] if not s.empty else None
+
+    agg = (tall.groupby(["period_norm","label_key"], as_index=False)
+                .agg({**{c:"mean" for c in num_cols},
+                      **{c:_first_nonempty for c in ["cta_ask_type","cta_copy","heroes","villains","victims","antiheroes"]
+                         if c in tall.columns}}))
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    agg.to_csv(out_csv, index=False)
+    print(f"[spiders] wrote {out_csv} rows={len(agg)}")
+
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -405,6 +448,13 @@ def main():
         print(f"✓ wrote/updated {len(new_rows)} rows; metrics total={len(tdf)} → {p}")
     else:
         print("No new rows; nothing written.")
+
+    # Materialize per-(period,label) spiders CSV for the apps
+    try:
+        _materialize_spiders_from_metrics(out_dir/"topic_metrics.parquet",
+                                        Path("data/affinity/reports/topics_enriched_spiders.csv"))
+    except Exception as e:
+        print(f"[spiders] materialization failed: {e}")
 
 if __name__ == "__main__":
     main()
