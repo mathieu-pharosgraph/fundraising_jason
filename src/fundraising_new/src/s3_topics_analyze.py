@@ -357,10 +357,13 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
         s = s[(s != "") & (s.str.lower() != "nan")]
         return s.iloc[0] if not s.empty else None
 
+
     agg = (tall.groupby(["period_norm","label_key"], as_index=False)
-                .agg({**{c:"mean" for c in num_cols},
-                      **{c:_first_nonempty for c in ["cta_ask_type","cta_copy","heroes","villains","victims","antiheroes"]
-                         if c in tall.columns}}))
+            .agg({**{c:"mean" for c in num_cols},
+                    **{c:_first_nonempty for c in ["cta_ask_type","cta_copy","heroes","villains","victims","antiheroes"]
+                    if c in tall.columns}}))
+
+
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     agg.to_csv(out_csv, index=False)
