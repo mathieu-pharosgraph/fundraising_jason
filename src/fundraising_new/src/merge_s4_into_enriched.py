@@ -76,21 +76,44 @@ def main():
             out[f"{c}__any"] = pd.NA
 
     # ---------- fill priority: existing -> pri -> sec -> any ----------
+    # numeric vs text columns
+    num_cols  = {"dem_fundraising_potential","gop_fundraising_potential"}
+    text_cols = {"classification","dem_angle","gop_angle"}
+
     for c in want:
         pri_c, sec_c, any_c = f"{c}__pri", f"{c}__sec", f"{c}__any"
-        if pri_c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-            out[pri_c] = pd.to_numeric(out[pri_c], errors="coerce")
-            out[c] = out[c].where(out[c].notna(), out[pri_c])
-            out.drop(columns=[pri_c], inplace=True)
-        if sec_c in out.columns:
-            out[sec_c] = pd.to_numeric(out[sec_c], errors="coerce")
-            out[c] = out[c].where(out[c].notna(), out[sec_c])
-            out.drop(columns=[sec_c], inplace=True)
-        if any_c in out.columns:
-            out[any_c] = pd.to_numeric(out[any_c], errors="coerce")
-            out[c] = out[c].where(out[c].notna(), out[any_c])
-            out.drop(columns=[any_c], inplace=True)
+
+        if c in num_cols:
+            # numeric fills (coerce only numeric columns)
+            if pri_c in out.columns:
+                out[c]     = pd.to_numeric(out[c],     errors="coerce")
+                out[pri_c] = pd.to_numeric(out[pri_c], errors="coerce")
+                out[c] = out[c].where(out[c].notna(), out[pri_c])
+                out.drop(columns=[pri_c], inplace=True)
+            if sec_c in out.columns:
+                out[sec_c] = pd.to_numeric(out[sec_c], errors="coerce")
+                out[c] = out[c].where(out[c].notna(), out[sec_c])
+                out.drop(columns=[sec_c], inplace=True)
+            if any_c in out.columns:
+                out[any_c] = pd.to_numeric(out[any_c], errors="coerce")
+                out[c] = out[c].where(out[c].notna(), out[any_c])
+                out.drop(columns=[any_c], inplace=True)
+
+        else:
+            # text fills (DO NOT coerce to numeric)
+            if pri_c in out.columns:
+                out[c] = out[c].where(out[c].astype(str).str.strip().ne(""), out[pri_c])
+                out[c] = out[c].where(out[c].notna(), out[pri_c])
+                out.drop(columns=[pri_c], inplace=True)
+            if sec_c in out.columns:
+                out[c] = out[c].where(out[c].astype(str).str.strip().ne(""), out[sec_c])
+                out[c] = out[c].where(out[c].notna(), out[sec_c])
+                out.drop(columns=[sec_c], inplace=True)
+            if any_c in out.columns:
+                out[c] = out[c].where(out[c].astype(str).str.strip().ne(""), out[any_c])
+                out[c] = out[c].where(out[c].notna(), out[any_c])
+                out.drop(columns=[any_c], inplace=True)
+
 
     # ---------- write ----------
     out.to_csv(args.out, index=False)
