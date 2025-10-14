@@ -66,7 +66,7 @@ def main():
                     on=["period_norm","label_key"], how="left")
 
     # ---------- tertiary (optional): label_key only, any period → latest processed_at ----------
-    if args.allow-any-period-fallback:
+    if args.allow_any_period_fallback:
         s4_any = s4.drop_duplicates(["label_key"], keep="last")
         out = out.merge(s4_any[["label_key"] + want]
                         .rename(columns={c:f"{c}__any" for c in want}),
