@@ -95,6 +95,39 @@ def deepseek_chat(messages, model=DEEPSEEK_MODEL, max_tokens=600, temperature=0.
     j = r.json()
     return j["choices"][0]["message"]["content"]
 
+def _normalize_cta(obj):
+    """
+    Accepts cta dicts with variant keys and returns a normalized dict:
+    {"ask_type": <str>, "ask_strength": <num>, "copy": <str>}
+    """
+    import re
+    if not isinstance(obj, dict):
+        return {}
+    def kfix(k):
+        k = str(k).lower().strip()
+        k = k.replace("-", "_").replace(" ", "_")
+        return k
+    d = {kfix(k): v for k, v in obj.items()}
+
+    ask_type     = d.get("ask_type") or d.get("type") or d.get("cta_type")
+    ask_strength = d.get("ask_strength") or d.get("strength") or d.get("score")
+    copy         = d.get("copy") or d.get("cta_copy") or d.get("text") or d.get("message")
+
+    try:
+        ask_strength = float(ask_strength) if ask_strength is not None else None
+    except Exception:
+        ask_strength = None
+
+    if isinstance(ask_type, str): ask_type = ask_type.strip()
+    if isinstance(copy, str):     copy     = copy.strip()
+
+    out = {}
+    if ask_type not in ("", None): out["ask_type"] = ask_type
+    if ask_strength is not None:   out["ask_strength"] = ask_strength
+    if copy not in ("", None):     out["copy"] = copy
+    return out
+
+
 def normalize_roles(x):
     # accept dict/string/None → dict of lists
     if isinstance(x, str):
@@ -312,7 +345,7 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
 
     emo   = pd.json_normalize(df["emotions"].map(_to_obj)).add_prefix("emo_")
     mf    = pd.json_normalize(df["moral_foundations"].map(_to_obj)).add_prefix("mf_")
-    cta   = pd.json_normalize(df["cta"].map(_to_obj)).add_prefix("cta_")
+    cta   = pd.json_normalize(df["cta"].map(_to_obj).map(_normalize_cta)).add_prefix("cta_")
     roles = pd.json_normalize(df["roles"].map(_to_obj))[["heroes","villains","victims","antiheroes"]]
 
     tall = pd.concat([df[["period_norm","label_key"]], emo, mf, cta, roles], axis=1)
@@ -387,20 +420,12 @@ def main():
                 # 1) main scoring call
                 res = score_group(label, snippets)
 
-                # 2) normalize roles and (optionally) roles-only pass if empty
+                # normalize roles (you already do)
                 roles = normalize_roles(res.get("roles"))
-                if not any(len(roles[k]) for k in ["villains", "heroes", "victims", "antiheroes"]):
-                    ro_txt = deepseek_chat(
-                        [{"role": "system", "content": "Return strict JSON only."},
-                         {"role": "user",   "content": ROLES_ONLY_PROMPT.format(snips="\n\n".join(snippets))}],
-                        max_tokens=300, temperature=0.1
-                    )
-                    roles = normalize_roles(safe_json_load(ro_txt))
+                ...
+                # normalize CTA (NEW)
+                cta_norm = _normalize_cta(res.get("cta", {}))
 
-                # 3) force pure JSON types (avoid ndarray/tuples in parquet round-trips)
-                roles = json.loads(json.dumps(roles))
-
-                # 4) build row from res + normalized roles
                 row = {
                     "signature": sig,
                     "cluster_id": int(cid),
@@ -411,12 +436,13 @@ def main():
                     "emotions": res.get("emotions"),
                     "emotions_top": res.get("emotions_top"),
                     "moral_foundations": res.get("moral_foundations"),
-                    "roles": roles,  # <-- use normalized roles
+                    "roles": roles,
                     "fundraising_hooks": res.get("fundraising_hooks"),
-                    "cta": res.get("cta"),
+                    "cta": cta_norm,                # <— write the normalized CTA dict
                     "notes": res.get("notes"),
                     "created_at": pd.Timestamp.utcnow().isoformat(),
                 }
+
 
             except Exception as e:
                 # On any failure, write an error row; don't reference res/roles here
