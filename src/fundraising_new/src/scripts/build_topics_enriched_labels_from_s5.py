@@ -143,22 +143,17 @@ def main():
     agg["standardized_topic_names"] = agg["topic_ids"].apply(lambda lst: "; ".join(lst) if lst else "")
     agg = agg[["label_key","standardized_topic_names"]]
 
-    # 3) Left-join to every label_key in feature-dot; fallback to raw label when missing
-    out = fd.merge(agg, on="label_key", how="left")
+    # 3) Keep ONLY canonical mappings (no fallback to raw labels here)
+    #    s7h will fallback to raw label if this map lacks a row for a given label_key.
 
-    def _fallback(val, fb):
-        # treat None/NaN/"nan"/"" as missing
-        if val is None:
-            return fb
-        s = str(val).strip()
-        if s == "" or s.lower() == "nan":
-            return fb
-        return s
+    out = agg[["label_key", "standardized_topic_names"]].copy()
+    out = out[out["standardized_topic_names"].astype(str).str.strip().ne("")]
+    out = out.drop_duplicates("label_key")
 
-    out["standardized_topic_names"] = [
-        _fallback(val, fb) for val, fb in zip(out.get("standardized_topic_names"), out["fallback_label"])
-    ]
-    out = out[["label_key","standardized_topic_names"]].drop_duplicates("label_key")
+    # write file
+    Path(OUT_CSV).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(OUT_CSV, index=False)
+    print(f"wrote {OUT_CSV} rows={len(out)} unique_label_keys={out['label_key'].nunique()}")
 
 
 if __name__ == "__main__":
