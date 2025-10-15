@@ -692,20 +692,8 @@ def main():
                 meta_all = meta.copy()
 
                 # write both snapshots
-                _write_snap(meta_accepted, "")     # strict (existing)
-                _write_snap(meta_all, "_all")      # new all-clusters snapshot
-
-
-
-                # add label_key (richer schema for app filtering)
-                snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
-
-                # attach standardized topics if we have them
-                if not std_topics.empty:
-                    snap = snap.merge(std_topics, on="cluster_id", how="left")
-
-                snap.to_parquet(out_path, index=False)
-                print(f"[snapshot] wrote {out_path} rows={len(snap)}")
+                snap = _write_snap(meta_accepted, "")
+                snap_all = _write_snap(meta_all, "_all")
 
             # update manifest after writing all days
             rows = []
