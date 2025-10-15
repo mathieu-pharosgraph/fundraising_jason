@@ -125,7 +125,7 @@ def main():
 
         d2 = df_labels.copy()
 
-        # Merge standardized topics on label_key, fallback to raw label text
+        # Merge standardized topics on label_key; fallback to raw label text
         if m is not None and not m.empty:
             d2 = d2.merge(m, on="label_key", how="left")
             d2["std_topic"] = d2["standardized_topic_names"].where(
@@ -135,42 +135,41 @@ def main():
         else:
             d2["std_topic"] = d2["label"].astype(str)
 
-        CANON = set([
-        "Non-Political / Other","Abortion & Reproductive Rights","Immigration Policy & Enforcement",
-        "Trump Administration & Policy Agenda","Election Integrity & Voting Rights",
-        "Healthcare Policy (ACA, Medicare, Medicaid)","Supreme Court & Judicial Affairs",
-        "Gun Policy & Violence","LGBTQ+ Rights","Economic Policy & indicators",
-        "Student Debt & Loan Forgiveness","Vaccines & Public Health",
-        "Climate Change & Environmental Policy","Foreign Policy & National Security",
-        "Ukraine-Russia War","Israel-Palestine Conflict","Civil Liberties & Free Speech",
-        "Law Enforcement & Policing","Congressional Dynamics & Legislation",
-        "Corporate Accountability & Business","Technology & AI Regulation",
-        "Labor & Workers' Rights","Education Policy","Social Security & Welfare Programs",
-        "Media & Journalism","Entertainment & Culture","Ethics & Corruption Scandals",
-        "Extremism & Domestic Threats","Censorship & Misinformation",
-        "Federal Agency Oversight","State vs. Federal Power","Refugee & Asylum Seeker Crisis",
-        "International Human Rights","Campaign Finance & Politics",
-        "Historical Legacy & Commemoration","Crime & Public Safety","Housing and Affordability",
-        "Opioid Crisis & Substance Abuse","Taxation & Fiscal Policy",
-        ])
+        # ---- robust explode for topics: handles JSON/Python list, ['A' 'B'], and delimited strings ----
+        import ast, re
+        def _parse_topics(raw) -> list[str]:
+            s = str(raw or "").strip()
+            if not s:
+                return []
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    v = ast.literal_eval(s)
+                    if isinstance(v, (list, tuple)):
+                        return [str(x).strip() for x in v if str(x).strip()]
+                except Exception:
+                    # fallback: pull quoted substrings inside the list
+                    parts = re.findall(r"'([^']+)'|\"([^\"]+)\"", s)
+                    vals  = [a or b for a, b in parts]
+                    if vals:
+                        return [t.strip() for t in vals if t.strip()]
+            # generic delimiters: ; | , or multiple spaces
+            return [p.strip() for p in re.split(r"\s*[|;,]\s*|\s{2,}", s) if p.strip()]
 
-        # explode
-        d2 = d2.assign(topic=d2["std_topic"].astype(str).str.split(r"\s*;\s*")).explode("topic", ignore_index=True)
-        d2["topic"] = d2["topic"].astype(str).strip()
+        d2 = d2.assign(topic=d2["std_topic"].apply(_parse_topics)).explode("topic", ignore_index=True)
+        d2["topic"] = d2["topic"].astype(str).str.strip()
         d2 = d2[(d2["topic"] != "") & (d2["topic"].str.lower() != "nan")]
-
-        # mark whether topic is canonical; if not, we’ll keep it only if the UI asks for story labels
-        d2["is_canonical"] = d2["topic"].isin(CANON)
 
         # Numeric coercion + aggregation
         d2["affinity_sum"] = pd.to_numeric(d2[col], errors="coerce").fillna(0.0)
         g = (d2.groupby(["period","topic"], as_index=False)["affinity_sum"].sum()
             .assign(track=track))
 
-        if party is not None:
-            g["party"] = party
+        # Always return a 'party' column for consistent concat
+        import numpy as np
+        g["party"] = party if party is not None else np.nan
 
-        return g[["period","topic","track","party","affinity_sum"]] if "party" in g.columns else g[["period","topic","track","affinity_sum"]]
+        return g[["period","topic","track","party","affinity_sum"]]
+
 
     tracks = []  # (track_name, party_or_None, column_name)
     if dem_col:  tracks.append(("party", "Dem", dem_col))
