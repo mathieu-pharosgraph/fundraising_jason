@@ -352,6 +352,95 @@ Now judge these cluster snippets:
 ---
 Return ONLY the JSON."""
 
+
+VOTING_PROMPT = """You are vetting a TOPIC CLUSTER for US political voter engagement and mobilization.
+
+Return STRICT JSON only with this schema:
+{
+  "us_relevance": true|false,
+  "voting_usable": true|false,
+  "voting_score": 0-100,
+  "party_lean": "Dem"|"GOP"|"Neutral",
+  "label": "3-6 word topic label",
+  "rationale": "1-2 sentences (why this topic can/cannot motivate voter support/engagement)"
+}
+
+Definition:
+- "voting_usable" = The topic can plausibly be turned into voter mobilization (emotional resonance, values alignment, threat/opportunity, clear stakes for voters).
+
+Rubric (tick ≥2 to set voting_usable=true, else false):
+- EMOTIONAL RESONANCE (evokes strong feelings - anger, hope, fear, pride)
+- VALUES ALIGNMENT (connects to core voter values/identity)
+- CLEAR STAKES FOR VOTERS (personal impact on voters' lives/rights/communities)
+- URGENCY/TIMELINESS (election relevance, immediate consequences)
+- SHARED NARRATIVE (fits broader political narrative that motivates base)
+
+Also decide party_lean (Dem/GOP/Neutral) if it obviously benefits one side's voter mobilization more.
+
+Now judge these cluster snippets:
+---
+{snips}
+---
+Return ONLY the JSON."""
+
+def llm_verify_label_voting(snippets: List[str]) -> Dict[str, Any]:
+    """LLM evaluation specifically for voting engagement potential"""
+    snips = "\n\n".join(f"- {s[:5000]}" for s in snippets[:10])
+    
+    msg = [
+        {"role":"system","content": "Return STRICT JSON only. No backticks, no markdown, no commentary."},
+        {"role":"user","content": VOTING_PROMPT.format(snips=snips)}
+    ]
+    
+    txt = deepseek_chat(msg)
+    
+    # Use the same robust JSON parsing as before
+    try:
+        js = safe_json_load(
+            txt,
+            schema={
+                "us_relevance": False,
+                "voting_usable": False,
+                "voting_score": 0,
+                "party_lean": "Neutral",
+                "label": "",
+                "rationale": ""
+            }
+        )
+    except Exception as e:
+        # Log failure and return safe fallback
+        Path("data/topics/metrics").mkdir(parents=True, exist_ok=True)
+        with open("data/topics/metrics/llm_label_voting_failures.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "error": str(e),
+                "raw": txt[:4000]
+            }, ensure_ascii=False) + "\n")
+        js = {
+            "us_relevance": False,
+            "voting_usable": False,
+            "voting_score": 0,
+            "party_lean": "Neutral",
+            "label": "Unknown",
+            "rationale": ""
+        }
+    
+    # Coercions / bounds
+    try:
+        vs = float(js.get("voting_score", 0))
+        js["voting_score"] = int(max(0, min(100, vs)))
+    except Exception:
+        js["voting_score"] = 0
+
+    js["party_lean"] = str(js.get("party_lean", "Neutral") or "Neutral").strip()[:12]
+    js["label"] = str(js.get("label", "Unknown") or "Unknown").strip()[:80]
+    js["rationale"] = str(js.get("rationale", "") or "")[:500]
+    js["us_relevance"] = bool(js.get("us_relevance", False))
+    js["voting_usable"] = bool(js.get("voting_usable", False))
+    
+    return js
+
+
 # ----- Robust JSON parsing helpers (drop-in) -----
 def _strip_fences(s: str) -> str:
     s = s.strip()
@@ -566,20 +655,31 @@ def main():
         cid = int(row["cluster_id"])
         ridx = df.set_index("item_id").loc[row["rep_item_ids"]]
         snippets = ridx["text"].fillna("").tolist()
-        verdict = llm_verify_label(snippets)
+        
+        # Get BOTH evaluations
+        fundraising_verdict = llm_verify_label(snippets)
+        voting_verdict = llm_verify_label_voting(snippets)
+        
         meta_rows.append({
             "cluster_id": cid,
             "n_items": int(row["n_items"]),
             "rep_item_ids": row["rep_item_ids"],
-            "us_relevance": bool(verdict.get("us_relevance", False)),
-            "fundraising_usable": bool(verdict.get("fundraising_usable", False)),
-            "fundraising_score": int(verdict.get("fundraising_score", 0)),
-            "party_lean": str(verdict.get("party_lean", "Neutral")),
-            "label": str(verdict.get("label","Unknown")).strip()[:80],
-            "rationale": str(verdict.get("rationale",""))[:500],
+            # Fundraising metrics
+            "fundraising_us_relevance": bool(fundraising_verdict.get("us_relevance", False)),
+            "fundraising_usable": bool(fundraising_verdict.get("fundraising_usable", False)),
+            "fundraising_score": int(fundraising_verdict.get("fundraising_score", 0)),
+            # Voting metrics  
+            "voting_us_relevance": bool(voting_verdict.get("us_relevance", False)),
+            "voting_usable": bool(voting_verdict.get("voting_usable", False)),
+            "voting_score": int(voting_verdict.get("voting_score", 0)),
+            # Shared fields (use fundraising verdict for consistency, or choose one)
+            "party_lean": str(fundraising_verdict.get("party_lean", "Neutral")),
+            "label": str(fundraising_verdict.get("label","Unknown")).strip()[:80],
+            "rationale": str(fundraising_verdict.get("rationale",""))[:500],
         })
-
-        time.sleep(0.5)  # be gentle to the API
+        
+        time.sleep(1.0)  # Increase delay since we're making 2 API calls
+        
     meta = pd.DataFrame(meta_rows).sort_values(
         ["fundraising_usable","fundraising_score","n_items"],
         ascending=[False,False,False]
