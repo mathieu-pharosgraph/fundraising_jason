@@ -664,15 +664,15 @@ def main():
             "cluster_id": cid,
             "n_items": int(row["n_items"]),
             "rep_item_ids": row["rep_item_ids"],
-            # Fundraising metrics
+            # Fundraising metrics WITH prefix
             "fundraising_us_relevance": bool(fundraising_verdict.get("us_relevance", False)),
             "fundraising_usable": bool(fundraising_verdict.get("fundraising_usable", False)),
             "fundraising_score": int(fundraising_verdict.get("fundraising_score", 0)),
-            # Voting metrics  
+            # Voting metrics (already have prefix)
             "voting_us_relevance": bool(voting_verdict.get("us_relevance", False)),
             "voting_usable": bool(voting_verdict.get("voting_usable", False)),
             "voting_score": int(voting_verdict.get("voting_score", 0)),
-            # Shared fields (use fundraising verdict for consistency, or choose one)
+            # Shared fields
             "party_lean": str(fundraising_verdict.get("party_lean", "Neutral")),
             "label": str(fundraising_verdict.get("label","Unknown")).strip()[:80],
             "rationale": str(fundraising_verdict.get("rationale",""))[:500],
