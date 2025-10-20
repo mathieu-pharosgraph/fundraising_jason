@@ -499,22 +499,27 @@ def main():
             row = {
                 "signature": sig,
                 "cluster_id": int(cid),
-                "label": label,
+                "label": fundraising_res.get("label", label),
                 "period": period,
-                # Fundraising metrics
-                "fundraising_urgency_score": np.nan,
-                "fundraising_emotions": None,
-                "fundraising_moral_foundations": None,
-                "fundraising_roles": None,
-                "fundraising_hooks": None,
-                "fundraising_cta": None,
-                # Voting metrics
-                "voting_urgency_score": np.nan,
-                "voting_emotions": None,
-                "voting_moral_foundations": None,
-                "voting_roles": None,
-                "voting_hooks": None,
-                "voting_cta": None,
+                # Fundraising metrics WITH prefix
+                "fundraising_urgency_score": fundraising_res.get("urgency_score"),
+                "fundraising_urgency_rationale": fundraising_res.get("urgency_rationale"),
+                "fundraising_emotions": fundraising_res.get("emotions"),
+                "fundraising_emotions_top": fundraising_res.get("emotions_top"),
+                "fundraising_moral_foundations": fundraising_res.get("moral_foundations"),
+                "fundraising_roles": normalize_roles(fundraising_res.get("roles")),
+                "fundraising_hooks": fundraising_res.get("fundraising_hooks"),
+                "fundraising_cta": fundraising_cta_norm,
+                # Voting metrics (already have prefix)
+                "voting_urgency_score": voting_res.get("urgency_score"),
+                "voting_urgency_rationale": voting_res.get("urgency_rationale"),
+                "voting_emotions": voting_res.get("emotions"),
+                "voting_emotions_top": voting_res.get("emotions_top"),
+                "voting_moral_foundations": voting_res.get("moral_foundations"),
+                "voting_roles": normalize_roles(voting_res.get("roles")),
+                "voting_hooks": voting_res.get("voting_hooks"),
+                "voting_cta": voting_cta_norm,
+                "notes": fundraising_res.get("notes"),
                 "created_at": pd.Timestamp.utcnow().isoformat(),
             }
         else:
