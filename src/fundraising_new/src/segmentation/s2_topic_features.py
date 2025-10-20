@@ -2,7 +2,6 @@
 import argparse, json, numpy as np, pandas as pd
 from pathlib import Path
 
-
 METRICS = Path("data/topics/metrics/topic_metrics.parquet")
 EVENTS  = Path("data/topics/topic_events.parquet")
 LEANDBG = Path("data/topics/_summary/party_lean_debug.csv")
@@ -21,32 +20,94 @@ def main():
     ap.add_argument("--events",  default=str(EVENTS))
     ap.add_argument("--lean-debug", default=str(LEANDBG))
     ap.add_argument("--out", default=str(OUT))
+    ap.add_argument("--context", choices=["both", "fundraising", "voting"], default="both",
+                   help="Which context to build features for")
     args = ap.parse_args()
 
     df = pd.read_parquet(args.metrics).copy()
     df["period"] = df["period"].astype(str)
-    base = df[["period","cluster_id","label","urgency_score","emotions","moral_foundations","fundraising_hooks","cta","emotions_top"]].copy()
+    
+    # Base columns that are common to both contexts
+    base_columns = ["period", "cluster_id", "label"]
+    
+    # Context-specific columns to process
+    context_configs = []
+    
+    if args.context in ["both", "fundraising"]:
+        fundraising_cols = {
+            "urgency_score": "fundraising_urgency_score",
+            "emotions": "fundraising_emotions", 
+            "moral_foundations": "fundraising_moral_foundations",
+            "hooks": "fundraising_hooks",
+            "cta": "fundraising_cta",
+            "emotions_top": "fundraising_emotions_top"
+        }
+        # Check if fundraising columns exist
+        if all(col in df.columns for col in fundraising_cols.values()):
+            context_configs.append(("fundraising", fundraising_cols))
+        else:
+            print("⚠️  Fundraising columns missing - skipping fundraising context")
+    
+    if args.context in ["both", "voting"]:
+        voting_cols = {
+            "urgency_score": "voting_urgency_score",
+            "emotions": "voting_emotions",
+            "moral_foundations": "voting_moral_foundations", 
+            "hooks": "voting_hooks",
+            "cta": "voting_cta",
+            "emotions_top": "voting_emotions_top"
+        }
+        # Check if voting columns exist
+        if all(col in df.columns for col in voting_cols.values()):
+            context_configs.append(("voting", voting_cols))
+        else:
+            print("⚠️  Voting columns missing - skipping voting context")
+    
+    if not context_configs:
+        raise ValueError("No valid context columns found to process")
 
-    # numeric flatten
-    em = pd.json_normalize(base["emotions"].apply(to_dict)).add_prefix("emo_")
-    mf = pd.json_normalize(base["moral_foundations"].apply(to_dict)).add_prefix("mf_")
-    hooks = pd.json_normalize(base["fundraising_hooks"].apply(to_dict)).add_prefix("hook_")
-    cta = pd.json_normalize(base["cta"].apply(to_dict)).add_prefix("cta_")
+    # Start with base columns
+    X = df[base_columns].copy()
+    
+    # Process each context
+    for context_name, col_map in context_configs:
+        # Select columns for this context
+        context_base = df[base_columns + list(col_map.values())].copy()
+        
+        # Rename columns to standard names for processing
+        rename_map = {v: k for k, v in col_map.items()}
+        context_base = context_base.rename(columns=rename_map)
+        
+        # Flatten nested JSON structures with context-specific prefixes
+        prefix = f"{context_name}_"
+        
+        em = pd.json_normalize(context_base["emotions"].apply(to_dict)).add_prefix(f"{prefix}emo_")
+        mf = pd.json_normalize(context_base["moral_foundations"].apply(to_dict)).add_prefix(f"{prefix}mf_")
+        hooks = pd.json_normalize(context_base["hooks"].apply(to_dict)).add_prefix(f"{prefix}hook_")
+        cta = pd.json_normalize(context_base["cta"].apply(to_dict)).add_prefix(f"{prefix}cta_")
+        
+        # Add urgency score and emotions_top
+        context_flat = pd.concat([
+            context_base[["period", "cluster_id", "label", "urgency_score", "emotions_top"]].rename(
+                columns={
+                    "urgency_score": f"{prefix}urgency_score",
+                    "emotions_top": f"{prefix}emotions_top"
+                }
+            ),
+            em, mf, hooks, cta
+        ], axis=1)
+        
+        # Merge with main dataframe
+        X = X.merge(context_flat, on=base_columns, how="left")
 
-    X = pd.concat([base.drop(columns=["emotions","moral_foundations","fundraising_hooks","cta"]),
-                   em, mf, hooks, cta], axis=1)
-
-    # events / items per day
+    # events / items per day (shared between contexts)
     if Path(args.events).exists():
         ev = pd.read_parquet(args.events).rename(columns={"day":"period"})
         X = X.merge(ev, on=["period","label"], how="left").rename(columns={"items":"items_per_day"})
     else:
-        X["items_per_day"]=0
+        X["items_per_day"] = 0
 
-    # party lean debug (if present)
-    # ---- party lean from political_classification only (no CSV) ----
-
-
+    # party lean debug (if present) - shared between contexts
     cls_path = Path("data/topics/political_classification.parquet")
     if not cls_path.exists():
         print("[info] political_classification.parquet missing → default to Neutral")
@@ -113,14 +174,13 @@ def main():
             if c in X.columns:
                 X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
 
-
-
     # clean
     num_cols = X.select_dtypes(include=[np.number]).columns
     X[num_cols] = X[num_cols].fillna(0)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     X.to_parquet(args.out, index=False)
     print("✓ wrote", args.out, "rows=", len(X))
+    print("✓ Contexts processed:", [name for name, _ in context_configs])
 
 if __name__ == "__main__":
     main()
