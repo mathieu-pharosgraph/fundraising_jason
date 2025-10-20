@@ -679,7 +679,7 @@ def main():
         })
         
         time.sleep(1.0)  # Increase delay since we're making 2 API calls
-        
+
     meta = pd.DataFrame(meta_rows).sort_values(
         ["fundraising_usable","fundraising_score","n_items"],
         ascending=[False,False,False]
@@ -762,8 +762,10 @@ def main():
                         print(f"[snapshot{suffix}] no clusters active on {snap_date}")
                         return
 
+                    # Update this line to include voting metrics in the snapshot:
                     joined = (it.merge(clusters_df, on="item_id", how="inner")
-                                .merge(meta_act[["cluster_id","label","party_lean","fundraising_score","rationale"]],
+                                .merge(meta_act[["cluster_id","label","party_lean",
+                                            "fundraising_score","voting_score","rationale"]],  # ADD voting_score
                                     on="cluster_id", how="inner"))
 
                     rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
@@ -771,10 +773,11 @@ def main():
                             .apply(lambda s: " | ".join([str(t)[:140] for t in s.head(5) if str(t).strip()]))
                             .reset_index(name="rep_titles_day"))
 
+                    # Update this to include voting metrics:
                     snap = (meta_act.merge(rep, on="cluster_id", how="left")
                             .assign(snapshot_date=snap_date)
                             [["snapshot_date","cluster_id","label","party_lean",
-                                "fundraising_score","rep_titles_day","rationale"]])
+                            "fundraising_score","voting_score","rep_titles_day","rationale"]])  # ADD voting_score
 
                     # label_key + topics (if available)
                     snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
