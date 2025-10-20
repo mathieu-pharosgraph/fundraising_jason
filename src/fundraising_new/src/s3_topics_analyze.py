@@ -296,17 +296,18 @@ def build_groups(items: pd.DataFrame,
     """Return groups to score - now includes both fundraising and voting acceptance"""
     
     # Accepted clusters for fundraising
+
     fundraising_acc = meta[
         (meta["fundraising_us_relevance"]) & 
         (meta["fundraising_usable"]) &
-        (meta["fundraising_score"] >= threshold)
+        (meta["fundraising_score"] >= args.fundraising_threshold)
     ][["cluster_id","label"]].drop_duplicates()
     
     # Accepted clusters for voting (if using voting threshold)
     voting_acc = meta[
         (meta["voting_us_relevance"]) & 
         (meta["voting_usable"]) &
-        (meta["voting_score"] >= threshold)
+        (meta["voting_score"] >= args.voting_threshold)
     ][["cluster_id","label"]].drop_duplicates()
     
     # Combine both sets of accepted clusters
@@ -465,7 +466,8 @@ def main():
     ap.add_argument("--by", choices=["day","all"], default="day")
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
-    ap.add_argument("--threshold", type=int, default=60)
+    ap.add_argument("--fundraising-threshold", type=int, default=60)
+    ap.add_argument("--voting-threshold", type=int, default=60)
     ap.add_argument("--max-snips", type=int, default=12)
     ap.add_argument("--recompute", action="store_true", help="ignore cache and recompute")
     ap.add_argument("--skip-llm", action="store_true")
