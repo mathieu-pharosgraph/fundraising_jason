@@ -24,6 +24,9 @@ def load_and_merge_data():
             if path.exists():
                 loaded_data[name] = pd.read_parquet(path)
                 print(f"Loaded {name} data: {len(loaded_data[name])} rows")
+                
+                # Print available columns to debug
+                print(f"  Available columns in {name}: {list(loaded_data[name].columns)}")
             else:
                 print(f"File not found: {path}")
                 loaded_data[name] = pd.DataFrame()
@@ -54,12 +57,29 @@ def load_and_merge_data():
                 suffixes=('', '_political')
             )
     
-    # Merge with meta data if available
+    # Merge with meta data if available - NOW INCLUDES VOTING COLUMNS
     if not meta_df.empty and not merged_df.empty and 'cluster_id' in merged_df.columns and 'cluster_id' in meta_df.columns:
+        # Define ALL columns we want from meta (both fundraising and voting)
+        meta_columns = [
+            'cluster_id', 
+            # Fundraising columns
+            'fundraising_us_relevance', 'fundraising_usable', 'fundraising_score',
+            # Voting columns  
+            'voting_us_relevance', 'voting_usable', 'voting_score',
+            # Shared columns
+            'party_lean', 'label', 'rationale'
+        ]
+        
+        # Only include columns that actually exist in meta_df
+        available_meta_columns = [col for col in meta_columns if col in meta_df.columns]
+        
+        print(f"Merging meta columns: {available_meta_columns}")
+        
         merged_df = merged_df.merge(
-            meta_df[['cluster_id', 'us_relevance', 'fundraising_usable', 'fundraising_score']],
+            meta_df[available_meta_columns],
             on='cluster_id',
-            how='left'
+            how='left',
+            suffixes=('', '_meta')
         )
     
     return merged_df
@@ -67,6 +87,11 @@ def load_and_merge_data():
 # Load the merged data
 merged_df = load_and_merge_data()
 print(f"Merged DataFrame has {len(merged_df)} rows")
+print(f"Available columns in merged data: {list(merged_df.columns)}")
+
+# Check if voting columns are present
+voting_columns = [col for col in merged_df.columns if 'voting' in col.lower()]
+print(f"Voting columns found: {voting_columns}")
 
 # Get the unique labels from the merged data
 cluster_labels = merged_df['label'].unique().tolist()
@@ -95,7 +120,7 @@ def get_hash(input_string):
     return hashlib.sha256(input_string.strip().encode('utf-8')).hexdigest()
 
 # 2. Configure the DeepSeek API Classifier
-API_KEY = #modify to load the key via secret.env  # Replace with your actual key
+API_KEY = "sk-2893e99d295945b292efbc7dcba825d5"  # Replace with your actual key
 API_URL = "https://api.deepseek.com/v1/chat/completions"  # Verify the correct endpoint
 
 # Our expertly crafted system prompt
@@ -294,3 +319,5 @@ output_path = "data/topics/merged_data_with_topics.parquet"
 merged_df.to_parquet(output_path, index=False)
 
 print(f"Classification complete! Results saved to: {output_path}")
+print(f"Final output includes {len(merged_df.columns)} columns")
+print(f"Voting metrics in output: {[col for col in merged_df.columns if 'voting' in col.lower()]}")
