@@ -206,6 +206,62 @@ SNIPPETS (bullet list, representative for ONE topic):
 Return JSON ONLY.
 """
 
+# Add this after your existing VERIFY_PROMPT
+VOTING_PROMPT = """You score a US political TOPIC for voter engagement and mobilization potential.
+
+Return STRICT JSON with this schema:
+{
+  "label": "<topic label 3-6 words>",
+  "urgency_score": 0-100,
+  "urgency_rationale": "<1 sentence why>",
+  "emotions": {
+    "fear": 0-100, "anger_outrage": 0-100, "sadness": 0-100,
+    "hope_optimism": 0-100, "pride": 0-100, "disgust": 0-100, "anxiety": 0-100
+  },
+  "emotions_top": "<one of: fear|anger_outrage|sadness|hope_optimism|pride|disgust|anxiety>",
+  "moral_foundations": {
+    "harm": 0-100, "care": 0-100, "fairness": 0-100, "cheating": 0-100,
+    "loyalty": 0-100, "betrayal": 0-100, "authority": 0-100, "subversion": 0-100,
+    "sanctity": 0-100, "degradation": 0-100, "liberty": 0-100, "oppression": 0-100
+  },
+  "roles": {
+    "heroes":   ["<entity/person/org>", ...],
+    "villains": ["<entity/person/org>", ...],
+    "victims":  ["<entity/person/org>", ...],
+    "antiheroes": ["<entity/person/org>", ...]
+  },
+  "voting_hooks": {
+    "emotional_resonance": true|false,
+    "values_alignment": true|false,
+    "clear_stakes": true|false,
+    "urgency_timeliness": true|false,
+    "shared_narrative": true|false
+  },
+  "voting_cta": {
+    "ask_strength": 0-100,
+    "ask_type": "<one of: register_vote|volunteer_signup|share_social|contact_reps|attend_rally|persuade_friends|early_vote>",
+    "copy": "<2 short sentences of voter engagement copy>"
+  },
+  "notes": "<OPTIONAL 1 sentence>"
+}
+
+Guidelines:
+- Scores are relative to US political voter mobilization norms.
+- "Urgency": election deadlines, immediate policy impacts, court decisions increase score.
+- Emotions: distribute realistically; do not set all high.
+- Moral foundations: score both sides of each pair separately.
+- Roles: list proper nouns or groups if explicit; else leave empty lists.
+- Hooks: set true if present in the snippets (not speculation).
+- Voting CTA: focused on voter actions, not donations; reflect the topic framing.
+
+SNIPPETS (bullet list, representative for ONE topic):
+---
+{snips}
+---
+
+Return JSON ONLY.
+"""
+
 # ---------- util ----------
 def safe_json_load(s: str) -> Dict[str, Any]:
     s = s.strip().strip("`").strip()
@@ -235,15 +291,31 @@ def build_groups(items: pd.DataFrame,
                  mode: str = "day",
                  start: str | None = None,
                  end: str | None = None,
-                 threshold: int = 60) -> pd.DataFrame:
-    """Return groups to score: one row per (cluster_id, period) with label and item_ids."""
-    # accepted clusters
-    acc = meta[(meta["us_relevance"]) & (meta["fundraising_usable"]) &
-               (meta["fundraising_score"] >= threshold)][["cluster_id","label"]].drop_duplicates()
-
+                 threshold: int = 60,
+                 use_voting_threshold: bool = False) -> pd.DataFrame:
+    """Return groups to score - now includes both fundraising and voting acceptance"""
+    
+    # Accepted clusters for fundraising
+    fundraising_acc = meta[
+        (meta["fundraising_us_relevance"]) & 
+        (meta["fundraising_usable"]) &
+        (meta["fundraising_score"] >= threshold)
+    ][["cluster_id","label"]].drop_duplicates()
+    
+    # Accepted clusters for voting (if using voting threshold)
+    voting_acc = meta[
+        (meta["voting_us_relevance"]) & 
+        (meta["voting_usable"]) &
+        (meta["voting_score"] >= threshold)
+    ][["cluster_id","label"]].drop_duplicates()
+    
+    # Combine both sets of accepted clusters
+    accepted_clusters = pd.concat([fundraising_acc, voting_acc]).drop_duplicates()
+    
     df = (items[["item_id","title","source","url","published_at","text"]]
           .merge(clusters[["item_id","cluster_id","cluster_prob"]], on="item_id", how="inner")
-          .merge(acc, on="cluster_id", how="inner"))
+          .merge(accepted_clusters, on="cluster_id", how="inner"))
+    
     df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
     if start:
         df = df[df["published_at"] >= pd.to_datetime(start, utc=True)]
@@ -257,7 +329,6 @@ def build_groups(items: pd.DataFrame,
         df["period"] = "all"
         key_cols = ["cluster_id","label","period"]
 
-    # aggregate: keep top-N by cluster_prob per group (decided later)
     df = df.sort_values(["cluster_id","published_at","cluster_prob"], ascending=[True, False, False])
     return df, key_cols
 
@@ -274,14 +345,31 @@ def make_snippets(sub: pd.DataFrame, max_snips: int = 12) -> List[str]:
     return out
 
 def score_group(label: str, snippets: List[str]) -> Dict[str, Any]:
+    """Score group for BOTH fundraising and voting"""
     snips = "\n\n".join(snippets)
-    prompt = VERIFY_PROMPT.format(snips=snips)
-    messages = [
+    
+    # Get fundraising metrics
+    fundraising_prompt = VERIFY_PROMPT.format(snips=snips)
+    fundraising_messages = [
         {"role":"system","content":"You are a strict JSON scoring assistant for US political fundraising."},
-        {"role":"user","content": prompt}
+        {"role":"user","content": fundraising_prompt}
     ]
-    raw = deepseek_chat(messages, max_tokens=800, temperature=0.15)
-    return safe_json_load(raw)
+    fundraising_raw = deepseek_chat(fundraising_messages, max_tokens=800, temperature=0.15)
+    fundraising_res = safe_json_load(fundraising_raw)
+    
+    # Get voting metrics  
+    voting_prompt = VOTING_PROMPT.format(snips=snips)
+    voting_messages = [
+        {"role":"system","content":"You are a strict JSON scoring assistant for US political voter engagement."},
+        {"role":"user","content": voting_prompt}
+    ]
+    voting_raw = deepseek_chat(voting_messages, max_tokens=800, temperature=0.15)
+    voting_res = safe_json_load(voting_raw)
+    
+    return {
+        "fundraising": fundraising_res,
+        "voting": voting_res
+    }
 
 # ---------- IO helpers ----------
 def load_topics_dir(topics_dir: Path) -> Tuple[pd.DataFrame,pd.DataFrame,pd.DataFrame]:
@@ -404,51 +492,67 @@ def main():
         if not args.recompute and ((cache["signature"] == sig).any()):
             continue
 
+        # In the main loop, replace the current row construction with:
         if args.skip_llm:
             row = {
                 "signature": sig,
                 "cluster_id": int(cid),
                 "label": label,
                 "period": period,
-                "urgency_score": np.nan,
-                "emotions": None,
-                "moral_foundations": None,
-                "roles": None,
+                # Fundraising metrics
+                "fundraising_urgency_score": np.nan,
+                "fundraising_emotions": None,
+                "fundraising_moral_foundations": None,
+                "fundraising_roles": None,
                 "fundraising_hooks": None,
-                "cta": None,
+                "fundraising_cta": None,
+                # Voting metrics
+                "voting_urgency_score": np.nan,
+                "voting_emotions": None,
+                "voting_moral_foundations": None,
+                "voting_roles": None,
+                "voting_hooks": None,
+                "voting_cta": None,
                 "created_at": pd.Timestamp.utcnow().isoformat(),
             }
         else:
             try:
-                # 1) main scoring call
+                # Get both sets of metrics
                 res = score_group(label, snippets)
-
-                # normalize roles (you already do)
-                roles = normalize_roles(res.get("roles"))
-
-                # normalize CTA (NEW)
-                cta_norm = _normalize_cta(res.get("cta", {}))
-
+                fundraising_res = res["fundraising"]
+                voting_res = res["voting"]
+                
+                # Normalize both CTAs
+                fundraising_cta_norm = _normalize_cta(fundraising_res.get("cta", {}))
+                voting_cta_norm = _normalize_cta(voting_res.get("voting_cta", {}))
+                
                 row = {
                     "signature": sig,
                     "cluster_id": int(cid),
-                    "label": res.get("label", label),
+                    "label": fundraising_res.get("label", label),  # Use fundraising label for consistency
                     "period": period,
-                    "urgency_score": res.get("urgency_score"),
-                    "urgency_rationale": res.get("urgency_rationale"),
-                    "emotions": res.get("emotions"),
-                    "emotions_top": res.get("emotions_top"),
-                    "moral_foundations": res.get("moral_foundations"),
-                    "roles": roles,
-                    "fundraising_hooks": res.get("fundraising_hooks"),
-                    "cta": cta_norm,                # <— write the normalized CTA dict
-                    "notes": res.get("notes"),
+                    # Fundraising metrics
+                    "fundraising_urgency_score": fundraising_res.get("urgency_score"),
+                    "fundraising_urgency_rationale": fundraising_res.get("urgency_rationale"),
+                    "fundraising_emotions": fundraising_res.get("emotions"),
+                    "fundraising_emotions_top": fundraising_res.get("emotions_top"),
+                    "fundraising_moral_foundations": fundraising_res.get("moral_foundations"),
+                    "fundraising_roles": normalize_roles(fundraising_res.get("roles")),
+                    "fundraising_hooks": fundraising_res.get("fundraising_hooks"),
+                    "fundraising_cta": fundraising_cta_norm,
+                    # Voting metrics
+                    "voting_urgency_score": voting_res.get("urgency_score"),
+                    "voting_urgency_rationale": voting_res.get("urgency_rationale"),
+                    "voting_emotions": voting_res.get("emotions"),
+                    "voting_emotions_top": voting_res.get("emotions_top"),
+                    "voting_moral_foundations": voting_res.get("moral_foundations"),
+                    "voting_roles": normalize_roles(voting_res.get("roles")),
+                    "voting_hooks": voting_res.get("voting_hooks"),
+                    "voting_cta": voting_cta_norm,
+                    "notes": fundraising_res.get("notes"),  # Use fundraising notes
                     "created_at": pd.Timestamp.utcnow().isoformat(),
                 }
-
-
             except Exception as e:
-                # On any failure, write an error row; don't reference res/roles here
                 row = {
                     "signature": sig,
                     "cluster_id": int(cid),
@@ -457,10 +561,9 @@ def main():
                     "error": f"{type(e).__name__}: {e}",
                     "created_at": pd.Timestamp.utcnow().isoformat(),
                 }
-
         new_rows.append(row)
         processed += 1
-        time.sleep(0.4)
+        time.sleep(0.8)
 
 
     # write out
