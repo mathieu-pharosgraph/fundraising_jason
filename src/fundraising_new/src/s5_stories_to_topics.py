@@ -120,7 +120,7 @@ def get_hash(input_string):
     return hashlib.sha256(input_string.strip().encode('utf-8')).hexdigest()
 
 # 2. Configure the DeepSeek API Classifier
-API_KEY = ""  # Replace with your actual key
+API_KEY = "sk-2893e99d295945b292efbc7dcba825d5"
 API_URL = "https://api.deepseek.com/v1/chat/completions"  # Verify the correct endpoint
 
 # Our expertly crafted system prompt
@@ -326,18 +326,45 @@ print(f"Voting metrics in output: {[col for col in merged_df.columns if 'voting'
 print(f"\n=== Exporting to topics_enriched.csv ===")
 
 try:
-    # Define canonical columns for CSV export
+    # Define canonical columns for CSV export - NOW INCLUDES VOTING
     canonical = [
+        # Core identifiers
         "period","cluster_id","label","story_label",
         "standardized_topic_names","standardized_topic_ids",
+        
+        # Political classification (BOTH fundraising and voting)
         "classification","gop_angle","dem_angle",
         "gop_fundraising_potential","dem_fundraising_potential",
-        "urgency_score","emotions_top",
-        "emo_anger_outrage","emo_anxiety","emo_disgust","emo_fear","emo_hope_optimism","emo_pride","emo_sadness",
-        "mf_care","mf_fairness","mf_harm","mf_liberty","mf_loyalty","mf_authority","mf_sanctity","mf_subversion","mf_cheating","mf_betrayal","mf_degradation","mf_oppression",
-        "hook_actionability","hook_clear_villain","hook_deadline_or_timing","hook_identity_activation","hook_threat_or_loss",
-        "heroes","villains","victims","antiheroes",
-        "cta_ask_strength","cta_ask_type","cta_copy"
+        "gop_voting_potential","dem_voting_potential",  # ADDED VOTING POTENTIALS
+        
+        # Fundraising metrics
+        "fundraising_urgency_score","fundraising_urgency_rationale","fundraising_emotions_top",
+        "fundraising_emo_anger_outrage","fundraising_emo_anxiety","fundraising_emo_disgust",
+        "fundraising_emo_fear","fundraising_emo_hope_optimism","fundraising_emo_pride","fundraising_emo_sadness",
+        "fundraising_mf_care","fundraising_mf_fairness","fundraising_mf_harm","fundraising_mf_liberty",
+        "fundraising_mf_loyalty","fundraising_mf_authority","fundraising_mf_sanctity","fundraising_mf_subversion",
+        "fundraising_mf_cheating","fundraising_mf_betrayal","fundraising_mf_degradation","fundraising_mf_oppression",
+        "fundraising_hook_actionability","fundraising_hook_clear_villain","fundraising_hook_deadline_or_timing",
+        "fundraising_hook_identity_activation","fundraising_hook_threat_or_loss",
+        "fundraising_heroes","fundraising_villains","fundraising_victims","fundraising_antiheroes",
+        "fundraising_cta_ask_strength","fundraising_cta_ask_type","fundraising_cta_copy",
+        
+        # Voting metrics  # ADDED VOTING COLUMNS
+        "voting_urgency_score","voting_urgency_rationale","voting_emotions_top",
+        "voting_emo_anger_outrage","voting_emo_anxiety","voting_emo_disgust",
+        "voting_emo_fear","voting_emo_hope_optimism","voting_emo_pride","voting_emo_sadness",
+        "voting_mf_care","voting_mf_fairness","voting_mf_harm","voting_mf_liberty",
+        "voting_mf_loyalty","voting_mf_authority","voting_mf_sanctity","voting_mf_subversion",
+        "voting_mf_cheating","voting_mf_betrayal","voting_mf_degradation","voting_mf_oppression",
+        "voting_hook_emotional_resonance","voting_hook_values_alignment","voting_hook_clear_stakes",
+        "voting_hook_urgency_timeliness","voting_hook_shared_narrative",
+        "voting_heroes","voting_villains","voting_victims","voting_antiheroes",
+        "voting_cta_ask_strength","voting_cta_ask_type","voting_cta_copy",
+        
+        # Shared metrics
+        "partisan_edge","party_score","party_confidence",
+        "fundraising_us_relevance","fundraising_usable","fundraising_score",
+        "voting_us_relevance","voting_usable","voting_score"
     ]
     
     # Normalize columns
@@ -360,6 +387,13 @@ try:
     out_df.to_csv(csv_path, index=False)
     print(f"✓ wrote {csv_path} with {len(out_df)} rows and {len(have)} columns")
     print(f"✓ Columns exported: {have}")
+    
+    # Check voting columns in output
+    voting_cols_in_output = [col for col in out_df.columns if 'voting' in col.lower()]
+    print(f"✓ Voting columns in CSV: {len(voting_cols_in_output)}")
+    for col in voting_cols_in_output:
+        coverage = out_df[col].notna().mean()
+        print(f"  - {col}: {coverage:.1%} coverage")
     
 except Exception as e:
     print(f"ERROR: Could not write topics_enriched.csv: {e}")
