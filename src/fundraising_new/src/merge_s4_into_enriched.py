@@ -8,16 +8,20 @@ def nkey(s: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--enriched", required=True)   # CSV: data/affinity/reports/topics_enriched.csv
-    ap.add_argument("--s4",       required=True)   # PARQUET: data/topics/political_classification_enriched.parquet
+    ap.add_argument("--enriched", required=True)   # CSV: data/affinity/reports/topics_enriched.csv (BOTH CONTEXTS)
+    ap.add_argument("--s4",       required=True)   # PARQUET: data/topics/political_classification_enriched.parquet (BOTH CONTEXTS)
     ap.add_argument("--s5",       default="data/topics/merged_data_with_topics.parquet")
     ap.add_argument("--out",      required=True)
     ap.add_argument("--allow-any-period-fallback", action="store_true",
                     help="If a row still misses, fill from S4 by label_key ignoring period (use latest processed_at).")
     args = ap.parse_args()
 
-    # ---------- load enriched ----------
+    print(f"[merge_s4_into_enriched] Starting merge with both fundraising and voting contexts...")
+
+    # ---------- load enriched (BOTH FUNDRAISING + VOTING) ----------
     en = pd.read_csv(args.enriched)
+    print(f"[merge_s4_into_enriched] Loaded enriched: {len(en)} rows, columns: {list(en.columns)}")
+    
     en["period_norm"] = pd.to_datetime(en.get("period",""), errors="coerce").dt.date.astype("string")
     lab_en = "story_label" if "story_label" in en.columns else ("label" if "label" in en.columns else None)
     en["label_key"] = en[lab_en].astype(str).apply(nkey) if lab_en else ""
@@ -36,57 +40,142 @@ def main():
     en["cluster_id"] = en["cluster_id"].where(en["cluster_id"].notna(),
                                               pd.to_numeric(en["cluster_id__s5"], errors="coerce").astype("Int64"))
     en.drop(columns=["cluster_id__s5"], inplace=True)
+    after = en["cluster_id"].notna().sum()
+    print(f"[merge_s4_into_enriched] Cluster ID backfill: {before} -> {after} non-null")
 
-    # ---------- load S4 and normalize ----------
+    # ---------- load S4 and normalize (BOTH FUNDRAISING + VOTING) ----------
     s4 = pd.read_parquet(args.s4)
+    print(f"[merge_s4_into_enriched] Loaded S4: {len(s4)} rows, columns: {list(s4.columns)}")
+    
     lab_s4 = "story_label" if "story_label" in s4.columns else ("label" if "label" in s4.columns else None)
     s4["period_norm"] = pd.to_datetime(s4.get("period",""), errors="coerce").dt.date.astype("string")
     s4["label_key"]   = s4[lab_s4].astype(str).apply(nkey) if lab_s4 else ""
     if "cluster_id" in s4.columns:
         s4["cluster_id"] = pd.to_numeric(s4["cluster_id"], errors="coerce").astype("Int64")
 
-    want = [c for c in ["classification","dem_angle","gop_angle",
-                        "dem_fundraising_potential","gop_fundraising_potential"] if c in s4.columns]
+    # Check if S4 has context column (new format with both fundraising + voting)
+    has_context = "context" in s4.columns
+    print(f"[merge_s4_into_enriched] S4 has context column: {has_context}")
+    
+    if has_context:
+        # NEW FORMAT: Split S4 by context and create proper column names
+        print(f"[merge_s4_into_enriched] Processing S4 with context separation...")
+        
+        s4_fundraising = s4[s4["context"] == "fundraising"].copy()
+        s4_voting = s4[s4["context"] == "voting"].copy()
+        
+        print(f"[merge_s4_into_enriched] Found {len(s4_fundraising)} fundraising rows, {len(s4_voting)} voting rows")
+        
+        # Rename generic potential columns to context-specific names
+        s4_fundraising = s4_fundraising.rename(columns={
+            "dem_potential": "dem_fundraising_potential",
+            "gop_potential": "gop_fundraising_potential"
+        })
+        s4_voting = s4_voting.rename(columns={
+            "dem_potential": "dem_voting_potential", 
+            "gop_potential": "gop_voting_potential"
+        })
+        
+        # Define columns we want for each context
+        common_cols = ["classification", "dem_angle", "gop_angle"]
+        fundraising_cols = common_cols + ["dem_fundraising_potential", "gop_fundraising_potential"]
+        voting_cols = common_cols + ["dem_voting_potential", "gop_voting_potential"]
+        
+        # Process fundraising context
+        s4_fundraising = s4_fundraising[["period_norm", "cluster_id", "label_key"] + fundraising_cols]
+        s4_voting = s4_voting[["period_norm", "cluster_id", "label_key"] + voting_cols]
+        
+    else:
+        # OLD FORMAT: Assume direct fundraising/voting columns exist
+        print(f"[merge_s4_into_enriched] Processing S4 with direct columns...")
+        fundraising_cols = [c for c in ["classification", "dem_angle", "gop_angle", 
+                                       "dem_fundraising_potential", "gop_fundraising_potential"] 
+                           if c in s4.columns]
+        voting_cols = [c for c in ["classification", "dem_angle", "gop_angle",
+                                  "dem_voting_potential", "gop_voting_potential"] 
+                      if c in s4.columns]
+        
+        s4_fundraising = s4[["period_norm", "cluster_id", "label_key"] + fundraising_cols].copy()
+        s4_voting = s4[["period_norm", "cluster_id", "label_key"] + voting_cols].copy()
 
-    # keep the latest per (period_norm,cluster_id) and per (period_norm,label_key)
+    print(f"[merge_s4_into_enriched] Fundraising columns to merge: {fundraising_cols}")
+    print(f"[merge_s4_into_enriched] Voting columns to merge: {voting_cols}")
+
+    # Keep the latest per (period_norm,cluster_id) and per (period_norm,label_key)
     if "processed_at" in s4.columns:
-        s4 = s4.sort_values("processed_at")
+        s4_fundraising = s4_fundraising.sort_values("processed_at")
+        s4_voting = s4_voting.sort_values("processed_at")
 
-    s4_pk = s4.drop_duplicates(["period_norm","cluster_id"], keep="last")
-    s4_lk = s4.drop_duplicates(["period_norm","label_key"], keep="last")
+    # Create primary and secondary keys for both contexts
+    s4_fundraising_pk = s4_fundraising.drop_duplicates(["period_norm","cluster_id"], keep="last")
+    s4_fundraising_lk = s4_fundraising.drop_duplicates(["period_norm","label_key"], keep="last")
+    
+    s4_voting_pk = s4_voting.drop_duplicates(["period_norm","cluster_id"], keep="last")
+    s4_voting_lk = s4_voting.drop_duplicates(["period_norm","label_key"], keep="last")
 
-    # ---------- primary merge: (period_norm, cluster_id) ----------
-    out = en.merge(s4_pk[["period_norm","cluster_id"] + want]
-                   .rename(columns={c:f"{c}__pri" for c in want}),
+    # Start with our enriched base (already has both contexts)
+    out = en.copy()
+
+    # ---------- MERGE FUNDRAISING DATA ----------
+    print(f"[merge_s4_into_enriched] Merging fundraising data...")
+    out = out.merge(s4_fundraising_pk[["period_norm","cluster_id"] + fundraising_cols]
+                   .rename(columns={c:f"{c}__pri" for c in fundraising_cols}),
                    on=["period_norm","cluster_id"], how="left")
 
-    # ---------- secondary merge: (period_norm, label_key) ----------
-    out = out.merge(s4_lk[["period_norm","label_key"] + want]
-                    .rename(columns={c:f"{c}__sec" for c in want}),
+    out = out.merge(s4_fundraising_lk[["period_norm","label_key"] + fundraising_cols]
+                    .rename(columns={c:f"{c}__sec" for c in fundraising_cols}),
+                    on=["period_norm","label_key"], how="left")
+
+    # ---------- MERGE VOTING DATA ----------
+    print(f"[merge_s4_into_enriched] Merging voting data...")
+    out = out.merge(s4_voting_pk[["period_norm","cluster_id"] + voting_cols]
+                   .rename(columns={c:f"{c}__pri" for c in voting_cols}),
+                   on=["period_norm","cluster_id"], how="left")
+
+    out = out.merge(s4_voting_lk[["period_norm","label_key"] + voting_cols]
+                    .rename(columns={c:f"{c}__sec" for c in voting_cols}),
                     on=["period_norm","label_key"], how="left")
 
     # ---------- tertiary (optional): label_key only, any period → latest processed_at ----------
     if args.allow_any_period_fallback:
-        s4_any = s4.drop_duplicates(["label_key"], keep="last")
-        out = out.merge(s4_any[["label_key"] + want]
-                        .rename(columns={c:f"{c}__any" for c in want}),
+        print(f"[merge_s4_into_enriched] Applying any-period fallback...")
+        s4_fundraising_any = s4_fundraising.drop_duplicates(["label_key"], keep="last")
+        s4_voting_any = s4_voting.drop_duplicates(["label_key"], keep="last")
+        
+        out = out.merge(s4_fundraising_any[["label_key"] + fundraising_cols]
+                        .rename(columns={c:f"{c}__any" for c in fundraising_cols}),
+                        on=["label_key"], how="left")
+        out = out.merge(s4_voting_any[["label_key"] + voting_cols]
+                        .rename(columns={c:f"{c}__any" for c in voting_cols}),
                         on=["label_key"], how="left")
     else:
-        for c in want:
+        for c in fundraising_cols + voting_cols:
             out[f"{c}__any"] = pd.NA
 
     # ---------- fill priority: existing -> pri -> sec -> any ----------
-    # numeric vs text columns
-    num_cols  = {"dem_fundraising_potential","gop_fundraising_potential"}
-    text_cols = {"classification","dem_angle","gop_angle"}
+    # Define numeric vs text columns
+    num_cols = {
+        "dem_fundraising_potential", "gop_fundraising_potential",
+        "dem_voting_potential", "gop_voting_potential"
+    }
+    text_cols = {"classification", "dem_angle", "gop_angle"}
 
-    for c in want:
+    all_cols = fundraising_cols + voting_cols
+    
+    for c in all_cols:
         pri_c, sec_c, any_c = f"{c}__pri", f"{c}__sec", f"{c}__any"
+
+        # Initialize the target column if it doesn't exist
+        if c not in out.columns:
+            if c in num_cols:
+                out[c] = pd.NA
+            else:
+                out[c] = ""
 
         if c in num_cols:
             # numeric fills (coerce only numeric columns)
             if pri_c in out.columns:
-                out[c]     = pd.to_numeric(out[c],     errors="coerce")
+                out[c] = pd.to_numeric(out[c], errors="coerce")
                 out[pri_c] = pd.to_numeric(out[pri_c], errors="coerce")
                 out[c] = out[c].where(out[c].notna(), out[pri_c])
                 out.drop(columns=[pri_c], inplace=True)
@@ -114,12 +203,28 @@ def main():
                 out[c] = out[c].where(out[c].notna(), out[any_c])
                 out.drop(columns=[any_c], inplace=True)
 
-
     # ---------- write ----------
     out.to_csv(args.out, index=False)
-    print("[merge_s4_into_enriched] wrote", args.out)
-    for c in want:
-        print(f"  coverage {c}: {out[c].notna().mean():.3%}")
+    print(f"[merge_s4_into_enriched] wrote {args.out}")
+    print(f"[merge_s4_into_enriched] Final coverage statistics:")
+    
+    # Check fundraising columns
+    print(f"  --- FUNDRAISING ---")
+    for c in fundraising_cols:
+        if c in out.columns:
+            coverage = out[c].notna().mean()
+            print(f"  {c}: {coverage:.3%}")
+        else:
+            print(f"  {c}: COLUMN MISSING")
+    
+    # Check voting columns  
+    print(f"  --- VOTING ---")
+    for c in voting_cols:
+        if c in out.columns:
+            coverage = out[c].notna().mean()
+            print(f"  {c}: {coverage:.3%}")
+        else:
+            print(f"  {c}: COLUMN MISSING")
 
 if __name__ == "__main__":
     main()
