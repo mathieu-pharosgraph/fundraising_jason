@@ -291,8 +291,8 @@ def build_groups(items: pd.DataFrame,
                  mode: str = "day",
                  start: str | None = None,
                  end: str | None = None,
-                 threshold: int = 60,
-                 use_voting_threshold: bool = False) -> pd.DataFrame:
+                 fundraising_threshold: int = 60,  # ← Change parameter name
+                 voting_threshold: int = 60):       # ← Add voting_threshold
     """Return groups to score - now includes both fundraising and voting acceptance"""
     
     # Accepted clusters for fundraising
@@ -300,15 +300,14 @@ def build_groups(items: pd.DataFrame,
     fundraising_acc = meta[
         (meta["fundraising_us_relevance"]) & 
         (meta["fundraising_usable"]) &
-        (meta["fundraising_score"] >= args.fundraising_threshold)
-    ][["cluster_id","label"]].drop_duplicates()
+        (meta["fundraising_score"] >= fundraising_threshold)  # ← Use parameter
+    ]
     
-    # Accepted clusters for voting (if using voting threshold)
     voting_acc = meta[
         (meta["voting_us_relevance"]) & 
         (meta["voting_usable"]) &
-        (meta["voting_score"] >= args.voting_threshold)
-    ][["cluster_id","label"]].drop_duplicates()
+        (meta["voting_score"] >= voting_threshold)  # ← Use parameter
+    ]
     
     # Combine both sets of accepted clusters
     accepted_clusters = pd.concat([fundraising_acc, voting_acc]).drop_duplicates()
@@ -476,8 +475,9 @@ def main():
     topics_dir = Path(args.topics_dir); out_dir = Path(args.out_dir)
     items, clusters, meta = load_topics_dir(topics_dir)
     df, key_cols = build_groups(items, clusters, meta,
-                                mode=args.by, start=args.start, end=args.end,
-                                threshold=args.threshold)
+                            mode=args.by, start=args.start, end=args.end,
+                            fundraising_threshold=args.fundraising_threshold,  # ← Correct parameter
+                            voting_threshold=args.voting_threshold)             # ← Correct parameter
 
     # build cache key per group
     cache_path = out_dir/"_cache_signatures.parquet"
@@ -499,27 +499,27 @@ def main():
             row = {
                 "signature": sig,
                 "cluster_id": int(cid),
-                "label": fundraising_res.get("label", label),
+                "label": label,
                 "period": period,
-                # Fundraising metrics WITH prefix
-                "fundraising_urgency_score": fundraising_res.get("urgency_score"),
-                "fundraising_urgency_rationale": fundraising_res.get("urgency_rationale"),
-                "fundraising_emotions": fundraising_res.get("emotions"),
-                "fundraising_emotions_top": fundraising_res.get("emotions_top"),
-                "fundraising_moral_foundations": fundraising_res.get("moral_foundations"),
-                "fundraising_roles": normalize_roles(fundraising_res.get("roles")),
-                "fundraising_hooks": fundraising_res.get("fundraising_hooks"),
-                "fundraising_cta": fundraising_cta_norm,
-                # Voting metrics (already have prefix)
-                "voting_urgency_score": voting_res.get("urgency_score"),
-                "voting_urgency_rationale": voting_res.get("urgency_rationale"),
-                "voting_emotions": voting_res.get("emotions"),
-                "voting_emotions_top": voting_res.get("emotions_top"),
-                "voting_moral_foundations": voting_res.get("moral_foundations"),
-                "voting_roles": normalize_roles(voting_res.get("roles")),
-                "voting_hooks": voting_res.get("voting_hooks"),
-                "voting_cta": voting_cta_norm,
-                "notes": fundraising_res.get("notes"),
+                # Fundraising metrics WITH prefix (ALL set to defaults)
+                "fundraising_urgency_score": np.nan,
+                "fundraising_urgency_rationale": "",
+                "fundraising_emotions": None,
+                "fundraising_emotions_top": "",
+                "fundraising_moral_foundations": None,
+                "fundraising_roles": {"heroes":[], "villains":[], "victims":[], "antiheroes":[]},
+                "fundraising_hooks": None,
+                "fundraising_cta": {},
+                # Voting metrics WITH prefix (ALL set to defaults)
+                "voting_urgency_score": np.nan,
+                "voting_urgency_rationale": "",
+                "voting_emotions": None,
+                "voting_emotions_top": "",
+                "voting_moral_foundations": None,
+                "voting_roles": {"heroes":[], "villains":[], "victims":[], "antiheroes":[]},
+                "voting_hooks": None,
+                "voting_cta": {},
+                "notes": "",
                 "created_at": pd.Timestamp.utcnow().isoformat(),
             }
         else:
