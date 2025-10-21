@@ -664,18 +664,20 @@ def main():
             "cluster_id": cid,
             "n_items": int(row["n_items"]),
             "rep_item_ids": row["rep_item_ids"],
-            # Fundraising metrics WITH prefix
+            # Fundraising metrics
             "fundraising_us_relevance": bool(fundraising_verdict.get("us_relevance", False)),
             "fundraising_usable": bool(fundraising_verdict.get("fundraising_usable", False)),
             "fundraising_score": int(fundraising_verdict.get("fundraising_score", 0)),
-            # Voting metrics (already have prefix)
+            "fundraising_party_lean": str(fundraising_verdict.get("party_lean", "Neutral")),
+            "fundraising_label": str(fundraising_verdict.get("label","Unknown")).strip()[:80],
+            "fundraising_rationale": str(fundraising_verdict.get("rationale",""))[:500],
+            # Voting metrics
             "voting_us_relevance": bool(voting_verdict.get("us_relevance", False)),
             "voting_usable": bool(voting_verdict.get("voting_usable", False)),
             "voting_score": int(voting_verdict.get("voting_score", 0)),
-            # Shared fields
-            "party_lean": str(fundraising_verdict.get("party_lean", "Neutral")),
-            "label": str(fundraising_verdict.get("label","Unknown")).strip()[:80],
-            "rationale": str(fundraising_verdict.get("rationale",""))[:500],
+            "voting_party_lean": str(voting_verdict.get("party_lean", "Neutral")),
+            "voting_label": str(voting_verdict.get("label","Unknown")).strip()[:80],
+            "voting_rationale": str(voting_verdict.get("rationale",""))[:500],
         })
         
         time.sleep(1.0)  # Increase delay since we're making 2 API calls
@@ -688,9 +690,13 @@ def main():
     meta.to_parquet(outdir / "cluster_meta.parquet", index=False)
     print(f"✓ wrote {outdir/'cluster_meta.parquet'} clusters={len(meta)}")
 
-    # Build daily topic intensity table for relevant clusters only
-    rel = meta[(meta.us_relevance) & (meta.fundraising_usable) & (meta.fundraising_score >= 60)]
-    rel_cids = set(rel["cluster_id"].tolist())
+    # Build daily topic intensity for BOTH fundraising AND voting relevant clusters
+    fundraising_rel = meta[(meta.fundraising_us_relevance) & (meta.fundraising_usable) & (meta.fundraising_score >= 60)]
+    voting_rel = meta[(meta.voting_us_relevance) & (meta.voting_usable) & (meta.voting_score >= 60)]
+
+    # Combine both sets
+    rel_cids = set(fundraising_rel["cluster_id"].tolist() + voting_rel["cluster_id"].tolist())
+
     df_rel = df[df["cluster_id"].isin(rel_cids)].merge(rel[["cluster_id","label"]], on="cluster_id", how="left")
     topic_events = (df_rel
         .assign(day=pd.to_datetime(df_rel["published_at"]).dt.date)
@@ -764,8 +770,8 @@ def main():
 
                     # Update this line to include voting metrics in the snapshot:
                     joined = (it.merge(clusters_df, on="item_id", how="inner")
-                                .merge(meta_act[["cluster_id","label","party_lean",
-                                            "fundraising_score","voting_score","rationale"]],  # ADD voting_score
+                                .merge(meta_act[["cluster_id","fundraising_label","fundraising_party_lean",
+                                            "fundraising_score","voting_score","fundraising_rationale"]],  # Use prefixed
                                     on="cluster_id", how="inner"))
 
                     rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
