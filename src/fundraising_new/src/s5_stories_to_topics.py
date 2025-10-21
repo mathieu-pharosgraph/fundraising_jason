@@ -120,7 +120,7 @@ def get_hash(input_string):
     return hashlib.sha256(input_string.strip().encode('utf-8')).hexdigest()
 
 # 2. Configure the DeepSeek API Classifier
-API_KEY = "sk-2893e99d295945b292efbc7dcba825d5"  # Replace with your actual key
+API_KEY = ""  # Replace with your actual key
 API_URL = "https://api.deepseek.com/v1/chat/completions"  # Verify the correct endpoint
 
 # Our expertly crafted system prompt
@@ -321,3 +321,45 @@ merged_df.to_parquet(output_path, index=False)
 print(f"Classification complete! Results saved to: {output_path}")
 print(f"Final output includes {len(merged_df.columns)} columns")
 print(f"Voting metrics in output: {[col for col in merged_df.columns if 'voting' in col.lower()]}")
+
+# ========== ADDED: Export to topics_enriched.csv ==========
+print(f"\n=== Exporting to topics_enriched.csv ===")
+
+try:
+    # Define canonical columns for CSV export
+    canonical = [
+        "period","cluster_id","label","story_label",
+        "standardized_topic_names","standardized_topic_ids",
+        "classification","gop_angle","dem_angle",
+        "gop_fundraising_potential","dem_fundraising_potential",
+        "urgency_score","emotions_top",
+        "emo_anger_outrage","emo_anxiety","emo_disgust","emo_fear","emo_hope_optimism","emo_pride","emo_sadness",
+        "mf_care","mf_fairness","mf_harm","mf_liberty","mf_loyalty","mf_authority","mf_sanctity","mf_subversion","mf_cheating","mf_betrayal","mf_degradation","mf_oppression",
+        "hook_actionability","hook_clear_villain","hook_deadline_or_timing","hook_identity_activation","hook_threat_or_loss",
+        "heroes","villains","victims","antiheroes",
+        "cta_ask_strength","cta_ask_type","cta_copy"
+    ]
+    
+    # Normalize columns
+    if "story_label" not in merged_df.columns and "label" in merged_df.columns:
+        merged_df["story_label"] = merged_df["label"].astype(str)
+    if "period" in merged_df.columns:
+        merged_df["period"] = merged_df["period"].astype(str)
+    if "standardized_topic_names" not in merged_df.columns:
+        merged_df["standardized_topic_names"] = ""
+    if "standardized_topic_ids" not in merged_df.columns:
+        merged_df["standardized_topic_ids"] = ""
+
+    # Only include columns that actually exist
+    have = [c for c in canonical if c in merged_df.columns]
+    out_df = merged_df[have].copy()
+    
+    # Export to CSV
+    csv_path = Path("data/affinity/reports/topics_enriched.csv")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(csv_path, index=False)
+    print(f"✓ wrote {csv_path} with {len(out_df)} rows and {len(have)} columns")
+    print(f"✓ Columns exported: {have}")
+    
+except Exception as e:
+    print(f"ERROR: Could not write topics_enriched.csv: {e}")
