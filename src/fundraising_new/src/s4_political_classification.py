@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced political classification with hashing for cache management.
-Standalone version that doesn't depend on topics_build module.
+Now supports BOTH fundraising and voting contexts.
 """
 
 import os
@@ -29,9 +29,9 @@ DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
 
 MAP_DIR = "data/topics/merged_data_with_topics.parquet"
 
-# Political classification prompt
+# ================= DUAL CONTEXT PROMPTS =================
 
-POLITICAL_CLASSIFICATION_PROMPT = """
+FUNDRAISING_CLASSIFICATION_PROMPT = """
 You are a political analyst specializing in US politics and fundraising. Today is {current_date}.
 Donald Trump is the CURRENT President of the United States, leading a Republican administration.
 Republicans control the White House and executive branch (including the DOJ).
@@ -62,6 +62,37 @@ Cluster items:
 {items_text}
 """
 
+VOTING_CLASSIFICATION_PROMPT = """
+You are a political analyst specializing in US politics and voter mobilization. Today is {current_date}.
+Donald Trump is the CURRENT President of the United States, leading a Republican administration.
+Republicans control the White House and executive branch (including the DOJ).
+
+Topic label: "{topic_label}"
+Standardized categories: {standardized_topics}
+
+For EACH party, produce a concise voter mobilization angle that would motivate **voters** of that party,
+and numeric voting potentials 0–100 (integers).
+
+Guidance
+- GOP angles: emphasize conservative values, border security, economic growth, anti-woke themes, election integrity.
+- DEM angles: emphasize protection of democracy, abortion rights, climate change, social justice, voting rights.
+- Focus on issues that drive voter turnout and engagement, not donations.
+- Keep each angle ≤160 chars. Be realistic to **today's** context.
+
+Return ONLY strict JSON with this exact schema (no extra keys, no text):
+{{
+  "story_label": "<short human label>",
+  "classification": "dem-owned" | "gop-owned" | "contested" | "dem-avoided" | "gop-avoided" | "non-political",
+  "dem_angle": "<string>",
+  "gop_angle": "<string>",
+  "dem_voting_potential": <0-100>,
+  "gop_voting_potential": <0-100>
+}}
+
+Cluster items:
+{items_text}
+"""
+
 def nkey(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
 
 def deepseek_chat(messages: List[Dict[str, str]], model="deepseek-chat",
@@ -86,7 +117,6 @@ def deepseek_chat(messages: List[Dict[str, str]], model="deepseek-chat",
     data = response.json()
     return data["choices"][0]["message"]["content"]
 
-# Add this helper function near the top of your script
 def get_current_date_context():
     """Get the current date and format it for context priming"""
     now = pd.Timestamp.now()
@@ -124,7 +154,8 @@ def safe_json_load(s: str) -> Dict[str, Any]:
         "gop_angle": "",
         "dem_angle": "",
         "reasoning": "Failed to parse JSON response",
-        "fundraising_potential": {"gop": 0, "dem": 0}
+        "fundraising_potential": {"gop": 0, "dem": 0},
+        "voting_potential": {"gop": 0, "dem": 0}
     }
 
 def compute_content_hash(items_df: pd.DataFrame) -> str:
@@ -136,23 +167,31 @@ def compute_content_hash(items_df: pd.DataFrame) -> str:
 
 # Fixed retry decorator
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def classify_topic_politically(topic_label: str, items_text: str, standardized_topics: List[str]) -> Dict[str, Any]:
-    """Classify a topic's political positioning using DeepSeek."""
+def classify_topic_politically(topic_label: str, items_text: str, standardized_topics: List[str], context: str = "fundraising") -> Dict[str, Any]:
+    """Classify a topic's political positioning using DeepSeek for specified context."""
     topics_str = ", ".join(standardized_topics) if isinstance(standardized_topics, list) else str(standardized_topics or "")
-    prompt = POLITICAL_CLASSIFICATION_PROMPT.format(
-        current_date=get_current_date_context(),    # <-- add this
-        topic_label=topic_label,
-        items_text=items_text,
-        standardized_topics=topics_str
-    )
+    
+    if context == "voting":
+        prompt = VOTING_CLASSIFICATION_PROMPT.format(
+            current_date=get_current_date_context(),
+            topic_label=topic_label,
+            items_text=items_text,
+            standardized_topics=topics_str
+        )
+    else:
+        prompt = FUNDRAISING_CLASSIFICATION_PROMPT.format(
+            current_date=get_current_date_context(),
+            topic_label=topic_label,
+            items_text=items_text,
+            standardized_topics=topics_str
+        )
 
     messages = [
-        {"role": "system", "content": "You are a political analyst specializing in US politics and fundraising. Be concise and objective."},
+        {"role": "system", "content": f"You are a political analyst specializing in US politics and {context}."},
         {"role": "user", "content": prompt}
     ]
     response = deepseek_chat(messages, max_tokens=400, temperature=0.1)
     return safe_json_load(response)
-
 
 def format_items_text(items_df: pd.DataFrame, max_items: int = 8) -> str:
     """Format representative items for the LLM prompt."""
@@ -174,7 +213,7 @@ def format_items_text(items_df: pd.DataFrame, max_items: int = 8) -> str:
 def load_topic_data(topics_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     items    = pd.read_parquet(topics_dir / "items.parquet")
     clusters = pd.read_parquet(topics_dir / "clusters.parquet")
-    meta     = pd.read_parquet(topics_dir / "cluster_meta.parquet")  # <-- bring back rep_item_ids, etc.
+    meta     = pd.read_parquet(topics_dir / "cluster_meta.parquet")
 
     # Optionally enrich meta with standardized topics (if present)
     std_path = topics_dir / "merged_data_with_topics.parquet"
@@ -186,24 +225,37 @@ def load_topic_data(topics_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
             meta = meta.merge(std[keep], on=["cluster_id","label"], how="left")
     return items, clusters, meta
 
-
 def load_or_create_cache(cache_path: Path) -> pd.DataFrame:
     """Load existing cache or create a new one."""
     if cache_path.exists():
         return pd.read_parquet(cache_path)
     else:
         return pd.DataFrame(columns=[
-            "cluster_id", "content_hash", "classification", "gop_angle", 
-            "dem_angle", "reasoning", "gop_fundraising_potential", 
-            "dem_fundraising_potential", "processed_at"
+            "cluster_id", "content_hash", "context", "classification", "gop_angle", 
+            "dem_angle", "gop_potential", "dem_potential", "processed_at"
         ])
 
-
-def validate_angle(topic_label: str, angle: str, party: str) -> str:
+def validate_angle(topic_label: str, angle: str, party: str, context: str) -> str:
     """Validate a political angle using LLM. Returns 'VALID' or error message."""
     current_context = get_current_date_context()
     
-    validation_prompt = f"""
+    if context == "voting":
+        validation_prompt = f"""
+Validate this political voter mobilization angle for {party}. Today is {current_context}:
+
+TOPIC: {topic_label}
+ANGLE: {angle}
+
+Check for:
+1. Focus on voter motivation and turnout, not donations.
+2. Relevance to the topic.
+3. Strategic soundness for voter mobilization (highlights stakes for voters).
+4. Correct temporal context (Trump is the CURRENT president).
+
+If valid, respond with "VALID". Otherwise, respond with "INVALID: [reason]".
+"""
+    else:
+        validation_prompt = f"""
 Validate this political fundraising angle for {party}. Today is {current_context}:
 
 TOPIC: {topic_label}
@@ -247,13 +299,16 @@ def is_empty_rep_item_ids(rep_item_ids) -> bool:
             return True
         return False
 
-
 def main():
     parser = argparse.ArgumentParser(description="Add political classification to topic analysis")
     parser.add_argument("--topics-dir", default="data/topics", help="Directory with topic data")
     parser.add_argument("--output-dir", default="data/topics", help="Output directory")
-    parser.add_argument("--threshold", type=int, default=60, 
+    parser.add_argument("--fundraising-threshold", type=int, default=60, 
                        help="Minimum fundraising score to include (0-100)")
+    parser.add_argument("--voting-threshold", type=int, default=60,
+                       help="Minimum voting score to include (0-100)")
+    parser.add_argument("--context", choices=["both", "fundraising", "voting"], default="both",
+                       help="Which context to classify")
     parser.add_argument("--max-items", type=int, default=8,
                        help="Maximum number of representative items to use per cluster")
     parser.add_argument("--cache-file", default="political_classification_cache.parquet",
@@ -268,200 +323,216 @@ def main():
     print("Loading topic data...")
     items, clusters, meta = load_topic_data(topics_dir)
     
-    # Filter to only relevant clusters with sufficient fundraising potential
-    relevant_meta = meta[
-        (meta["us_relevance"]) & 
-        (meta["fundraising_usable"]) & 
-        (meta["fundraising_score"] >= args.threshold)
-    ].copy()
+    # Determine which contexts to process
+    contexts_to_process = []
+    if args.context in ["both", "fundraising"]:
+        # Filter for fundraising-relevant clusters
+        fundraising_meta = meta[
+            (meta["fundraising_us_relevance"]) & 
+            (meta["fundraising_usable"]) & 
+            (meta["fundraising_score"] >= args.fundraising_threshold)
+        ].copy()
+        if not fundraising_meta.empty:
+            contexts_to_process.append(("fundraising", fundraising_meta))
     
-    print(f"Found {len(relevant_meta)} relevant clusters with fundraising score >= {args.threshold}")
+    if args.context in ["both", "voting"]:
+        # Filter for voting-relevant clusters  
+        voting_meta = meta[
+            (meta["voting_us_relevance"]) & 
+            (meta["voting_usable"]) & 
+            (meta["voting_score"] >= args.voting_threshold)
+        ].copy()
+        if not voting_meta.empty:
+            contexts_to_process.append(("voting", voting_meta))
+    
+    if not contexts_to_process:
+        print("No relevant clusters found for the specified contexts and thresholds")
+        return
     
     # Load cache
     cache_path = output_dir / args.cache_file
     cache_df = load_or_create_cache(cache_path)
     print(f"Cache contains {len(cache_df)} entries")
     
-    # Get representative items for each cluster
-    clusters_to_process = []
-    for _, row in relevant_meta.iterrows():
-        cluster_id = row["cluster_id"]
+    # Process each context
+    all_results = []
+    for context_name, context_meta in contexts_to_process:
+        print(f"\n=== Processing {context_name.upper()} context ===")
+        print(f"Found {len(context_meta)} relevant clusters with {context_name} score >= {getattr(args, f'{context_name}_threshold')}")
         
-        rep_item_ids = row.get("rep_item_ids", [])
-        
-        # Check if rep_item_ids is empty using our safe function
-        if is_empty_rep_item_ids(rep_item_ids):
-            continue
+        # Get clusters to process for this context
+        clusters_to_process = []
+        for _, row in context_meta.iterrows():
+            cluster_id = row["cluster_id"]
             
-        # Convert to list if it's a string representation
-        if isinstance(rep_item_ids, str):
-            try:
-                rep_item_ids = json.loads(rep_item_ids)
-            except:
+            rep_item_ids = row.get("rep_item_ids", [])
+            
+            # Check if rep_item_ids is empty using our safe function
+            if is_empty_rep_item_ids(rep_item_ids):
                 continue
                 
-        # Get the representative items
-        rep_items = items[items["item_id"].isin(rep_item_ids)]
-        if len(rep_items) == 0:
-            continue
-        
-        # Compute content hash to check if we need to reprocess
-        content_hash = compute_content_hash(rep_items)
-        
-        # Check if we have a cached result for this cluster with the same content
-        cached_result = cache_df[
-            (cache_df["cluster_id"] == cluster_id) & 
-            (cache_df["content_hash"] == content_hash)
-        ]
-        
-        if not cached_result.empty:
-            # Skip if we have a cached result for this content
-            print(f"Skipping cluster {cluster_id} (already processed with same content)")
-            continue
-
-        # Get standardized topics
-        standardized_topics = row.get('standardized_topic_names', [])
-        if isinstance(standardized_topics, str):
-            try:
-                standardized_topics = json.loads(standardized_topics)
-            except:
-                standardized_topics = [standardized_topics]
-        elif not isinstance(standardized_topics, list):
-            standardized_topics = []
-            
-        clusters_to_process.append({
-            "cluster_id": cluster_id,
-            "label": row["label"],
-            "rep_items": rep_items,
-            "content_hash": content_hash,
-            "standardized_topics": standardized_topics
-        })
-    
-    seen_keys = set()
-    deduped = []
-    for _c in clusters_to_process:
-        k = (int(_c["cluster_id"]), str(_c["content_hash"]))
-        if k in seen_keys:
-            continue
-        seen_keys.add(k)
-        deduped.append(_c)
-    clusters_to_process = deduped
-    print(f"Processing {len(clusters_to_process)} clusters for political classification")
-    
-    # Process each cluster
-    results = []
-    for cluster in clusters_to_process:
-        cluster_id = cluster["cluster_id"]
-        label = cluster["label"]
-        rep_items = cluster["rep_items"]
-        content_hash = cluster["content_hash"]
-        standardized_topics = cluster["standardized_topics"]
-        
-        print(f"Processing cluster {cluster_id}: {label}")
-        
-        # Format items for LLM
-        items_text = format_items_text(rep_items, args.max_items)
-        
-        try:
-            # Get political classification
-            classification_result = classify_topic_politically(
-                label, 
-                items_text, 
-                standardized_topics
-            )
-            # ---- normalize/fallback schema (accept nested or flat) ----
-            fp = classification_result.get("fundraising_potential", {}) if isinstance(classification_result, dict) else {}
-
-            # prefer explicit flat fields; fallback to nested
-            dem_raw = classification_result.get("dem_fundraising_potential", fp.get("dem"))
-            gop_raw = classification_result.get("gop_fundraising_potential", fp.get("gop"))
-
-            classification_result["dem_fundraising_potential"] = _clip01(dem_raw)
-            classification_result["gop_fundraising_potential"] = _clip01(gop_raw)
-
-            classification_result["classification"] = str(classification_result.get("classification", "unknown"))
-            classification_result["dem_angle"] = str(classification_result.get("dem_angle", ""))
-            classification_result["gop_angle"] = str(classification_result.get("gop_angle", ""))
-            # -----------------------------------------------------------
-
-            # Extract angles
-            gop_angle = classification_result.get("gop_angle", "")
-            dem_angle = classification_result.get("dem_angle", "")
-
-            # Validate angles
-            gop_validation = validate_angle(label, gop_angle, "GOP")
-            if "VALID" not in gop_validation:
-                print(f"GOP angle invalid for cluster {cluster_id}: {gop_validation}")
-                # Optionally, you can set a flag or skip saving this angle
-            dem_validation = validate_angle(label, dem_angle, "DEM")
-            if "VALID" not in dem_validation:
-                print(f"DEM angle invalid for cluster {cluster_id}: {dem_validation}")
-
-            # Add to results
-            # Map both old (nested) and new (flat) schemas
-            fp = classification_result.get("fundraising_potential") or {}
-            gop_fp_old = fp.get("gop")
-            dem_fp_old = fp.get("dem")
-
-            gop_fp_new = classification_result.get("gop_fundraising_potential")
-            dem_fp_new = classification_result.get("dem_fundraising_potential")
-
-            def _num(x):
+            # Convert to list if it's a string representation
+            if isinstance(rep_item_ids, str):
                 try:
-                    return int(float(x))
-                except Exception:
-                    return None
+                    rep_item_ids = json.loads(rep_item_ids)
+                except:
+                    continue
+                    
+            # Get the representative items
+            rep_items = items[items["item_id"].isin(rep_item_ids)]
+            if len(rep_items) == 0:
+                continue
+            
+            # Compute content hash to check if we need to reprocess
+            content_hash = compute_content_hash(rep_items)
+            
+            # Check if we have a cached result for this cluster with the same content and context
+            cached_result = cache_df[
+                (cache_df["cluster_id"] == cluster_id) & 
+                (cache_df["content_hash"] == content_hash) &
+                (cache_df["context"] == context_name)
+            ]
+            
+            if not cached_result.empty:
+                # Skip if we have a cached result for this content and context
+                print(f"Skipping cluster {cluster_id} for {context_name} (already processed with same content)")
+                continue
 
-            gop_fp = next(v for v in [_num(gop_fp_new), _num(gop_fp_old)] if v is not None) if any([gop_fp_new is not None, gop_fp_old is not None]) else None
-            dem_fp = next(v for v in [_num(dem_fp_new), _num(dem_fp_old)] if v is not None) if any([dem_fp_new is not None, dem_fp_old is not None]) else None
-
-            result = {
+            # Get standardized topics
+            standardized_topics = row.get('standardized_topic_names', [])
+            if isinstance(standardized_topics, str):
+                try:
+                    standardized_topics = json.loads(standardized_topics)
+                except:
+                    standardized_topics = [standardized_topics]
+            elif not isinstance(standardized_topics, list):
+                standardized_topics = []
+                
+            clusters_to_process.append({
                 "cluster_id": cluster_id,
+                "label": row["label"],
+                "rep_items": rep_items,
                 "content_hash": content_hash,
-                "label": label,
-                "story_label": label,
-                "classification": classification_result.get("classification", "unknown"),
-                "gop_angle": classification_result.get("gop_angle", ""),
-                "dem_angle": classification_result.get("dem_angle", ""),
-                "reasoning": classification_result.get("reasoning", ""),
-                "gop_fundraising_potential": classification_result.get("gop_fundraising_potential"),
-                "dem_fundraising_potential": classification_result.get("dem_fundraising_potential"),
-                "processed_at": pd.Timestamp.now()
-            }
-
-            
-            results.append(result)
-            # incremental cache write — ensures we skip repeats in this run
-            try:
-                cache_df = pd.concat([
-                    cache_df,
-                    pd.DataFrame([{"cluster_id": int(cluster_id), "content_hash": content_hash}])
-                ], ignore_index=True).drop_duplicates(["cluster_id","content_hash"])
-                cache_df.to_parquet(cache_path, index=False)
-            except Exception:
-                pass
-            print(f"  Classification: {result['classification']}")
-            
-            # Be kind to the API
-            time.sleep(1)
-            
-        except Exception as e:
-            print(f"Error processing cluster {cluster_id}: {str(e)}")
-            # Add error record
-            results.append({
-                "cluster_id": cluster_id,
-                "content_hash": content_hash,
-                "label": label,
-                "classification": "error",
-                "error": str(e),
-                "processed_at": pd.Timestamp.now()
+                "standardized_topics": standardized_topics,
+                "context": context_name
             })
-    
-    # Update cache and save results
-    if results:
-        results_df = pd.DataFrame(results)
         
-        # ---- attach period via cluster_id from merged_data_with_topics.parquet
+        # Deduplicate
+        seen_keys = set()
+        deduped = []
+        for _c in clusters_to_process:
+            k = (int(_c["cluster_id"]), str(_c["content_hash"]), _c["context"])
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            deduped.append(_c)
+        clusters_to_process = deduped
+        
+        print(f"Processing {len(clusters_to_process)} clusters for {context_name} political classification")
+        
+        # Process each cluster for this context
+        context_results = []
+        for cluster in clusters_to_process:
+            cluster_id = cluster["cluster_id"]
+            label = cluster["label"]
+            rep_items = cluster["rep_items"]
+            content_hash = cluster["content_hash"]
+            standardized_topics = cluster["standardized_topics"]
+            context_name = cluster["context"]
+            
+            print(f"Processing cluster {cluster_id} for {context_name}: {label}")
+            
+            # Format items for LLM
+            items_text = format_items_text(rep_items, args.max_items)
+            
+            try:
+                # Get political classification for this context
+                classification_result = classify_topic_politically(
+                    label, 
+                    items_text, 
+                    standardized_topics,
+                    context_name
+                )
+                
+                # Normalize schema
+                if context_name == "fundraising":
+                    potential_key = "fundraising_potential"
+                    dem_potential = classification_result.get("dem_fundraising_potential")
+                    gop_potential = classification_result.get("gop_fundraising_potential")
+                else:
+                    potential_key = "voting_potential" 
+                    dem_potential = classification_result.get("dem_voting_potential")
+                    gop_potential = classification_result.get("gop_voting_potential")
+                
+                # Extract angles
+                gop_angle = classification_result.get("gop_angle", "")
+                dem_angle = classification_result.get("dem_angle", "")
+
+                # Validate angles
+                gop_validation = validate_angle(label, gop_angle, "GOP", context_name)
+                if "VALID" not in gop_validation:
+                    print(f"GOP angle invalid for cluster {cluster_id} ({context_name}): {gop_validation}")
+                
+                dem_validation = validate_angle(label, dem_angle, "DEM", context_name)
+                if "VALID" not in dem_validation:
+                    print(f"DEM angle invalid for cluster {cluster_id} ({context_name}): {dem_validation}")
+
+                # Create result
+                result = {
+                    "cluster_id": cluster_id,
+                    "content_hash": content_hash,
+                    "context": context_name,
+                    "label": label,
+                    "story_label": classification_result.get("story_label", label),
+                    "classification": classification_result.get("classification", "unknown"),
+                    "gop_angle": gop_angle,
+                    "dem_angle": dem_angle,
+                    "gop_potential": _clip01(gop_potential),
+                    "dem_potential": _clip01(dem_potential),
+                    "processed_at": pd.Timestamp.now()
+                }
+                
+                context_results.append(result)
+                
+                # Update cache
+                try:
+                    cache_df = pd.concat([
+                        cache_df,
+                        pd.DataFrame([{
+                            "cluster_id": int(cluster_id), 
+                            "content_hash": content_hash,
+                            "context": context_name
+                        }])
+                    ], ignore_index=True).drop_duplicates(["cluster_id", "content_hash", "context"])
+                    cache_df.to_parquet(cache_path, index=False)
+                except Exception:
+                    pass
+                
+                print(f"  {context_name.capitalize()} Classification: {result['classification']}")
+                
+                # Be kind to the API
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"Error processing cluster {cluster_id} for {context_name}: {str(e)}")
+                # Add error record
+                context_results.append({
+                    "cluster_id": cluster_id,
+                    "content_hash": content_hash,
+                    "context": context_name,
+                    "label": label,
+                    "classification": "error",
+                    "error": str(e),
+                    "processed_at": pd.Timestamp.now()
+                })
+        
+        all_results.extend(context_results)
+    
+    # Save results
+    if all_results:
+        results_df = pd.DataFrame(all_results)
+        
+        # Attach period via cluster_id from merged_data_with_topics.parquet
         mp = ds.dataset(MAP_DIR, format="parquet").to_table(columns=["cluster_id","period"]).to_pandas()
         mp["period"] = mp["period"].astype(str)
         mp = mp.drop_duplicates(["cluster_id","period"])
@@ -469,11 +540,11 @@ def main():
         results_df["story_label"] = results_df["label"].astype(str)
         results_df = results_df.merge(mp, on="cluster_id", how="left") 
 
-        # ---- normalize numeric types and clamp to 0..100
-        for c in ["dem_fundraising_potential","gop_fundraising_potential"]:
+        # Normalize numeric types and clamp to 0..100
+        for c in ["dem_potential", "gop_potential"]:
             results_df[c] = pd.to_numeric(results_df.get(c, np.nan), errors="coerce").clip(0,100)
 
-        # ---- label_key for stable merges
+        # Create label_key for stable merges
         results_df["label_key"] = (
             results_df["story_label"]
             .astype(str)
@@ -483,50 +554,36 @@ def main():
         )
         results_df["period"] = results_df["period"].astype(str)
         results_df["cluster_id"] = pd.to_numeric(results_df["cluster_id"], errors="coerce").astype("Int64")
-        # ---- write an enriched parquet for downstream merges
+        
+        # Save enriched results
         enriched_out = output_dir / "political_classification_enriched.parquet"
-        results_df[[
-            "period","cluster_id","story_label","label_key",
-            "classification","dem_angle","gop_angle",
-            "dem_fundraising_potential","gop_fundraising_potential",
-            "processed_at"
-        ]].to_parquet(enriched_out, index=False)
+        results_df.to_parquet(enriched_out, index=False)
         print(f"Saved political classification (enriched) to {enriched_out}")
 
         # Update cache with new results
-        cache_df = pd.concat([cache_df, results_df], ignore_index=True)
+        cache_df = pd.concat([cache_df, results_df[["cluster_id", "content_hash", "context"]]], ignore_index=True)
+        cache_df = cache_df.drop_duplicates(["cluster_id", "content_hash", "context"])
         cache_df.to_parquet(cache_path, index=False)
         print(f"Updated cache with {len(results_df)} new entries: {cache_path}")
         
-        # Create a comprehensive results file with all classifications
+        # Create comprehensive results file
         all_classifications_path = output_dir / "political_classification.parquet"
-        
-        # Load existing results if they exist
-        if all_classifications_path.exists():
-            existing_results = pd.read_parquet(all_classifications_path)
-            # Remove any existing records for these clusters
-            existing_results = existing_results[~existing_results["cluster_id"].isin(results_df["cluster_id"])]
-            # Combine with new results
-            results_df = pd.concat([existing_results, results_df], ignore_index=True)
-        
         results_df.to_parquet(all_classifications_path, index=False)
         print(f"Saved political classification to {all_classifications_path}")
         
-        # Create a simplified angles table for easy use
-        angles_df = results_df[["cluster_id", "label", "classification", "gop_angle", "dem_angle"]].copy()
-        angles_path = output_dir / "political_angles.parquet"
-        angles_df.to_parquet(angles_path, index=False)
-        print(f"Saved political angles to {angles_path}")
+        # Create separate files for each context
+        for context_name in results_df["context"].unique():
+            context_df = results_df[results_df["context"] == context_name].copy()
+            context_path = output_dir / f"political_classification_{context_name}.parquet"
+            context_df.to_parquet(context_path, index=False)
+            print(f"Saved {context_name} political classification to {context_path}")
+            
+            # Create angles table for this context
+            angles_df = context_df[["cluster_id", "label", "classification", "gop_angle", "dem_angle"]].copy()
+            angles_path = output_dir / f"political_angles_{context_name}.parquet"
+            angles_df.to_parquet(angles_path, index=False)
+            print(f"Saved {context_name} political angles to {angles_path}")
         
-        # Update the cluster_meta with political classification
-        meta_with_politics = meta.merge(
-            results_df[["cluster_id", "classification"]], 
-            on="cluster_id", 
-            how="left"
-        )
-        meta_with_politics_path = output_dir / "cluster_meta_with_politics.parquet"
-        meta_with_politics.to_parquet(meta_with_politics_path, index=False)
-        print(f"Updated cluster_meta with political classification: {meta_with_politics_path}")
     else:
         print("No new clusters processed")
 
