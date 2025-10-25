@@ -743,7 +743,7 @@ def process_topic_batch(
         news_items = []
         if start_dt and end_dt:
             # Heuristic: 2–3 day chunks for 2–6 week windows; 1 day if very long and you want max recall
-            days = 3 if _window_days(start_dt, end_dt) <= 45 else 2
+            days = 1
             for ch_start, ch_end in _daterange_chunks(start_dt, end_dt, days=days):
                 arts = get_newsapi_articles(
                     q,
@@ -916,35 +916,79 @@ def daily_collection_job(start_dt: datetime | None = None,
     # 4) Process (ad-hoc if dates/hours provided, else windowed)
     all_content = []
 
-    # If a date window or relative hours is provided: run once immediately
+    # If a date window or relative hours is provided: run ad-hoc
     if start_dt or end_dt or (from_hours is not None):
-        content_batch = process_topic_batch(
-            topics_to_process, window_name="ad_hoc",
-            start_dt=start_dt, end_dt=end_dt, from_hours=from_hours
-        )
-        content_batch = _dedup_items(content_batch)
-        all_content.extend(content_batch)
-        all_content = _dedup_items(all_content)
+        # If end was passed as a date-only at midnight, treat it as inclusive end-of-day
+        if end_dt and end_dt.time() == dt.time(0, 0):
+            end_dt = end_dt + dt.timedelta(days=1)
 
-        output_filename = f"content_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_ad_hoc.json"
-        output_path = DATA_DIR / output_filename
-        try:
-            with open(output_path, 'w') as f:
-                json.dump({
-                    'metadata': {
-                        'gathered_at': dt.datetime.now().isoformat(),
-                        'content_count': len(content_batch),
-                        'topics_used': [q for (_, q) in topics_to_process],
-                        'topic_categories_used': [c for (c, _) in topics_to_process],
-                        'start_dt': start_dt.isoformat() if start_dt else None,
-                        'end_dt': end_dt.isoformat() if end_dt else None,
-                        'from_hours': from_hours
-                    },
-                    'content': content_batch
-                }, f, indent=2)
-            print(f"Saved {len(content_batch)} items (ad-hoc) -> {output_path}")
-        except Exception as e:
-            print(f"Failed to write ad-hoc output: {e}")
+        if start_dt and end_dt:
+            # ---- per-day loop ----
+            for ch_start, ch_end in _daterange_chunks(start_dt, end_dt, days=1):
+                day_str = ch_start.date().isoformat()
+                print(f"[ad-hoc] collecting day {day_str} …")
+
+                content_batch = process_topic_batch(
+                    topics_to_process,
+                    window_name=f"ad_hoc_{day_str}",
+                    start_dt=ch_start,
+                    end_dt=ch_end,
+                    from_hours=None,           # not used when absolute range provided
+                )
+                content_batch = _dedup_items(content_batch)
+                all_content.extend(content_batch)
+                all_content = _dedup_items(all_content)
+
+                # save ONE FILE PER DAY
+                output_filename = f"content_{day_str}_ad_hoc.json"
+                output_path = DATA_DIR / output_filename
+                try:
+                    with open(output_path, 'w') as f:
+                        json.dump({
+                            'metadata': {
+                                'gathered_at': dt.datetime.now().isoformat(),
+                                'content_count': len(content_batch),
+                                'topics_used': [q for (_, q) in topics_to_process],
+                                'topic_categories_used': [c for (c, _) in topics_to_process],
+                                'start_dt': ch_start.isoformat(),
+                                'end_dt': ch_end.isoformat(),
+                                'from_hours': None
+                            },
+                            'content': content_batch
+                        }, f, indent=2)
+                    print(f"Saved {len(content_batch)} items (ad-hoc day) -> {output_path}")
+                except Exception as e:
+                    print(f"Failed to write ad-hoc day {day_str} output: {e}")
+        else:
+            # ---- relative window (single batch) ----
+            content_batch = process_topic_batch(
+                topics_to_process, window_name="ad_hoc",
+                start_dt=None, end_dt=None, from_hours=from_hours
+            )
+            content_batch = _dedup_items(content_batch)
+            all_content.extend(content_batch)
+            all_content = _dedup_items(all_content)
+
+            output_filename = f"content_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_ad_hoc.json"
+            output_path = DATA_DIR / output_filename
+            try:
+                with open(output_path, 'w') as f:
+                    json.dump({
+                        'metadata': {
+                            'gathered_at': dt.datetime.now().isoformat(),
+                            'content_count': len(content_batch),
+                            'topics_used': [q for (_, q) in topics_to_process],
+                            'topic_categories_used': [c for (c, _) in topics_to_process],
+                            'start_dt': None,
+                            'end_dt': None,
+                            'from_hours': from_hours
+                        },
+                        'content': content_batch
+                    }, f, indent=2)
+                print(f"Saved {len(content_batch)} items (ad-hoc relative) -> {output_path}")
+            except Exception as e:
+                print(f"Failed to write ad-hoc output: {e}")
+
 
     else:
         # ORIGINAL windowed behavior
