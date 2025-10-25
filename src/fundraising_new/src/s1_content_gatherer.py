@@ -4,7 +4,7 @@ import datetime
 import time
 import requests
 import praw
-import snscrape.modules.twitter as sntwitter
+#import snscrape.modules.twitter as sntwitter
 from collections import defaultdict, Counter
 from typing import List, Dict, Any
 from dotenv import load_dotenv
@@ -16,13 +16,18 @@ import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from glob import glob
 import numpy as np
-
+from typing import Tuple
 
 # Calculate the path to the .env file
 current_dir = Path(__file__).parent
 env_path = current_dir.parent.parent / "secret.env"
 
-NEWSAPI_MAX_PAGES = int(os.getenv("NEWSAPI_MAX_PAGES", "1"))  # default 1 for free tier
+# --- new env controls (top of file, after load_dotenv)
+NEWSAPI_RPM = int(os.getenv("NEWSAPI_RPM", "120"))        # tune to your paid tier reality
+REDDIT_RPM  = int(os.getenv("REDDIT_RPM", "50"))          # PRAW-friendly ceiling
+NEWSAPI_MAX_PAGES = int(os.getenv("NEWSAPI_MAX_PAGES", "5"))
+NEWSAPI_PAGE_SIZE = int(os.getenv("NEWSAPI_PAGE_SIZE", "100"))  # 100 is common max
+
 
 # Add this after your existing imports
 DATA_DIR = Path(__file__).parent / "data"
@@ -79,6 +84,162 @@ SEED_TOPICS = [
     "israel", "palestine"
 ]
 
+TOPIC_TAXONOMY = {
+  "abortion_repro_rights": {
+    "include": ["abortion", "reproductive rights", "roe v wade", "dobbs decision", "planned parenthood", "heartbeat bill"],
+    "exclude": ["veterinary", "animal breeding"]
+  },
+  "immigration_policy": {
+    "include": ["immigration policy", "border security", "asylum seekers", "daca", "dreamers", "deportation", "ice", "cbp"],
+    "exclude": []
+  },
+  "trump_policy_agenda": {
+    "include": ["trump administration", "trump policy", "executive order", "maga agenda", "project 2025"],
+    "exclude": []
+  },
+  "election_integrity": {
+    "include": ["election integrity", "voter suppression", "voting rights", "voter id", "ballot access", "election security"],
+    "exclude": []
+  },
+  "healthcare_policy": {
+    "include": ["affordable care act", "obamacare", "medicare", "medicaid", "drug pricing", "prescription costs"],
+    "exclude": []
+  },
+  "supreme_court": {
+    "include": ["supreme court", "scotus", "certiorari", "oral arguments", "opinion issued"],
+    "exclude": []
+  },
+  "gun_policy": {
+    "include": ["gun control", "gun violence", "second amendment", "assault weapons ban", "nra"],
+    "exclude": []
+  },
+  "lgbtq_rights": {
+    "include": ["lgbtq rights", "transgender rights", "bathroom bill", "gender affirming care"],
+    "exclude": []
+  },
+  "economy_macro": {
+    "include": ["economic policy", "inflation", "jobs report", "cpi", "unemployment rate", "fed rate", "gdp"],
+    "exclude": ["crypto price tips"]
+  },
+  "student_debt": {
+    "include": ["student loans", "loan forgiveness", "borrower defense", "save plan"],
+    "exclude": []
+  },
+  "public_health_vaccines": {
+    "include": ["vaccines", "public health", "cdc guidance", "covid booster", "pandemic preparedness"],
+    "exclude": []
+  },
+  "climate_env": {
+    "include": ["climate change", "epa regulation", "renewable energy", "green new deal", "carbon emissions"],
+    "exclude": []
+  },
+  "foreign_policy_natsec": {
+    "include": ["foreign policy", "national security", "state department", "defense policy", "nato", "china policy"],
+    "exclude": []
+  },
+  "ukraine_russia_war": {
+    "include": ["ukraine war", "russia invasion", "aid to ukraine"],
+    "exclude": []
+  },
+  "israel_palestine": {
+    "include": ["israel palestine", "gaza", "idf", "ceasefire", "settlements"],
+    "exclude": []
+  },
+  "civil_liberties_speech": {
+    "include": ["free speech", "first amendment", "civil liberties", "aCLU litigation"],
+    "exclude": ["campus sports speech awards"]  # example noise
+  },
+  "policing_public_safety": {
+    "include": ["law enforcement", "policing reform", "qualified immunity", "public safety"],
+    "exclude": []
+  },
+  "congress_legislation": {
+    "include": ["congress", "house bill", "senate bill", "committee markup", "appropriations"],
+    "exclude": []
+  },
+  "corporate_accountability": {
+    "include": ["corporate accountability", "antitrust", "consumer protection", "ftc", "doj antitrust"],
+    "exclude": []
+  },
+  "tech_ai_reg": {
+    "include": ["ai regulation", "tech policy", "section 230", "privacy bill", "algorithms"],
+    "exclude": []
+  },
+  "labor_workers_rights": {
+    "include": ["labor rights", "unionization", "strike", "nlrb", "minimum wage", "overtime rule"],
+    "exclude": []
+  },
+  "education_policy": {
+    "include": ["education policy", "curriculum standards", "school board", "title ix (education)"],
+    "exclude": ["ncaa title ix sports litigation"]  # optional
+  },
+  "social_security_welfare": {
+    "include": ["social security", "welfare programs", "snap benefits", "ssi"],
+    "exclude": []
+  },
+  "media_journalism": {
+    "include": ["media bias", "press freedom", "journalism", "defamation case"],
+    "exclude": []
+  },
+  "entertainment_culture": {
+    "include": ["culture war", "hollywood strike", "awards controversy"],
+    "exclude": []
+  },
+  "ethics_corruption": {
+    "include": ["ethics investigation", "corruption scandal", "hatch act", "inspector general"],
+    "exclude": []
+  },
+  "extremism_domestic": {
+    "include": ["domestic extremism", "militia", "hate crime", "counterterrorism"],
+    "exclude": []
+  },
+  "censorship_misinfo": {
+    "include": ["censorship", "misinformation", "content moderation", "disinformation"],
+    "exclude": []
+  },
+  "federal_oversight": {
+    "include": ["agency oversight", "gao report", "oig report", "congressional oversight"],
+    "exclude": []
+  },
+  "state_federal_power": {
+    "include": ["states rights", "preemption", "federalism", "10th amendment"],
+    "exclude": []
+  },
+  "refugee_asylum": {
+    "include": ["refugee crisis", "asylum seekers", "resettlement program"],
+    "exclude": []
+  },
+  "intl_human_rights": {
+    "include": ["international human rights", "un human rights council", "icc"],
+    "exclude": []
+  },
+  "campaign_finance_politics": {
+    "include": ["campaign finance", "fec filing", "dark money", "super pac"],
+    "exclude": []
+  },
+  "history_commemoration": {
+    "include": ["historical legacy", "statue removal", "commemoration", "national archive"],
+    "exclude": []
+  },
+  "crime_public_safety": {
+    "include": ["crime rates", "public safety", "criminal justice reform", "bail reform"],
+    "exclude": []
+  },
+  "housing_affordability": {
+    "include": ["housing affordability", "zoning reform", "rent control", "mortgage rates"],
+    "exclude": []
+  },
+  "opioids_substance_abuse": {
+    "include": ["opioid crisis", "overdose deaths", "settlement", "harm reduction"],
+    "exclude": []
+  },
+  "taxation_fiscal": {
+    "include": ["tax policy", "tax cuts", "budget deficit", "debt ceiling", "irs enforcement"],
+    "exclude": []
+  }
+}
+
+
 # ================= RATE LIMITING SYSTEM =================
 class RateLimiter:
     """Smart rate limiter to stay within API limits"""
@@ -108,10 +269,51 @@ class RateLimiter:
         time.sleep(self.min_delay)
 
 # Initialize rate limiters
-reddit_limiter = RateLimiter(55)  # Stay under 60 RPM
-newsapi_limiter = RateLimiter(30)  # NewsAPI free tier is 100 requests/day
+reddit_limiter = RateLimiter(REDDIT_RPM)
+newsapi_limiter = RateLimiter(NEWSAPI_RPM)
 
 # ================= CORE FUNCTIONS =================
+
+def taxonomy_queries() -> List[Tuple[str, str]]:
+    """
+    Build (category, query) pairs from TOPIC_TAXONOMY using include terms
+    plus NOT-excludes as simple guards.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for cat, rules in TOPIC_TAXONOMY.items():
+        inc = [t.strip() for t in rules.get("include", []) if t.strip()]
+        exc = [t.strip() for t in rules.get("exclude", []) if t.strip()]
+        for term in inc:
+            q = " ".join([f'"{term}"'] + [f'-"{x}"' for x in exc])
+            pairs.append((cat, q))
+    return pairs
+
+
+def seed_queries(base_seeds: List[str]) -> List[Tuple[str, str]]:
+    """
+    Tag seeds under 'seed' category and return (category, query) pairs.
+    """
+    return [("seed", f'"{s}"') for s in base_seeds]
+
+
+def label_categories_from_taxonomy(title: str, description: str, content: str) -> List[str]:
+    """
+    Post-hoc category labels using TOPIC_TAXONOMY include/exclude rules.
+    """
+    t = " ".join([(title or ""), (description or ""), (content or "")]).lower()
+    out: List[str] = []
+    for cat, rules in TOPIC_TAXONOMY.items():
+        inc = [x.lower() for x in rules.get("include", [])]
+        exc = [x.lower() for x in rules.get("exclude", [])]
+        if inc and not any(x in t for x in inc):
+            continue
+        if exc and any(x in t for x in exc):
+            continue
+        out.append(cat)
+    return out
+
+
+
 def setup_reddit_client():
     """Initialize and return a Reddit client using PRAW"""
     try:
@@ -129,58 +331,120 @@ def setup_reddit_client():
         print(f"✗ Failed to initialize Reddit client: {str(e)}")
         return None
 
-def get_newsapi_articles(query: str, page_size: int = 100, max_pages: int = 1, search_in="title,description") -> List[Dict[str, Any]]:
+def get_newsapi_articles(
+    query: str,
+    page_size: int = None,
+    max_pages: int = None,
+    search_in="title,description",
+    from_hours: int = 72,        # recency window
+    language: str = "en",
+    sort_by: str = "publishedAt"
+) -> List[Dict[str, Any]]:
 
-    """Fetch articles from NewsAPI.org for a given query."""
-    newsapi_limiter.wait_if_needed()
-    
+    page_size = page_size or NEWSAPI_PAGE_SIZE
+    max_pages = max_pages or NEWSAPI_MAX_PAGES
+
     articles = []
-    try:
-        url = "https://newsapi.org/v2/everything"
+    base_url = "https://newsapi.org/v2/everything"
+    now = datetime.datetime.utcnow()
+    from_param = (now - datetime.timedelta(hours=from_hours)).isoformat(timespec="seconds") + "Z"
+
+    page = 1
+    consecutive_empty = 0
+    backoff = 2.0
+
+    while page <= max_pages:
+        newsapi_limiter.wait_if_needed()
+
         params = {
-            'q': query,
-            'sortBy': 'publishedAt',
-            'apiKey': NEWSAPI_KEY,
-            'pageSize': page_size,
-            'language': 'en'
+            "q": query,
+            "searchIn": search_in,    # supported by many paid tiers
+            "sortBy": sort_by,
+            "apiKey": NEWSAPI_KEY,
+            "pageSize": page_size,
+            "page": page,
+            "language": language,
+            "from": from_param,
         }
 
-        response = requests.get(url, params=params)
-        
-        if response.status_code != 200:
-            print(f"NewsAPI error for '{query}': {response.status_code}")
-            return articles
-            
-        data = response.json()
+        try:
+            resp = requests.get(base_url, params=params, timeout=20)
+            if resp.status_code == 429:
+                # rate limited: backoff and retry this same page
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            if resp.status_code >= 500:
+                # transient server error: backoff and retry
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            if resp.status_code != 200:
+                print(f"NewsAPI error {resp.status_code} for '{query}' p{page}: {resp.text[:200]}")
+                break
 
-        if data['status'] == 'ok':
-            print(f"Found {data['totalResults']} total results for '{query}'")
-            for article in data['articles']:
-                if article.get('content') in [None, '[Removed]', '[+ chars]']:
-                    continue
-                    
-                content = article.get('content', '')
-                if '[+' in content and 'chars]' in content:
-                    content = article.get('description', content)
-                
-                articles.append({
-                    'source': 'newsapi',
-                    'title': article.get('title', ''),
-                    'content': content,
-                    'description': article.get('description', ''),
-                    'url': article.get('url', ''),
-                    'published_at': article.get('publishedAt', ''),
-                    'source_name': article.get('source', {}).get('name', ''),
-                    'author': article.get('author', ''),
-                    'query': query
+            data = resp.json()
+            if data.get("status") != "ok":
+                print(f"NewsAPI non-ok for '{query}' p{page}: {data}")
+                break
+
+            page_articles = []
+            for art in data.get("articles", []):
+                content = art.get("content") or ""
+                if content in (None, "[Removed]", "[+ chars]"):
+                    content = art.get("description") or ""
+
+                page_articles.append({
+                    "source": "newsapi",
+                    "title": art.get("title", ""),
+                    "content": content,
+                    "description": art.get("description", ""),
+                    "url": art.get("url", ""),
+                    "published_at": art.get("publishedAt", ""),
+                    "source_name": art.get("source", {}).get("name", ""),
+                    "author": art.get("author", ""),
+                    "query": query
                 })
-        else:
-            print(f"NewsAPI error for query '{query}': {data.get('message', 'Unknown error')}")
 
-    except Exception as e:
-        print(f"General exception fetching news for {query}: {str(e)}")
+            if not page_articles:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    # two empty pages in a row: likely exhausted
+                    break
+            else:
+                consecutive_empty = 0
+                articles.extend(page_articles)
+
+            # If fewer than page_size came back, stop early
+            if len(page_articles) < page_size:
+                break
+
+            page += 1
+            backoff = 2.0  # reset on success
+
+        except requests.RequestException as e:
+            print(f"NewsAPI request exception for '{query}' p{page}: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            # retry same page
 
     return articles
+
+def _dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for it in items:
+        url = (it.get("url") or "").strip().lower()
+        if not url:
+            # fallback key
+            key = (it.get("source",""), it.get("source_name",""), it.get("title","").strip().lower(), str(it.get("published_at","")))
+        else:
+            key = ("url", url)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
 
 def get_reddit_posts(reddit_client, subreddit_name: str, topic: str, time_filter: str = 'day', limit: int = 10) -> List[Dict[str, Any]]:
     """Fetch posts from a specific subreddit about a specific topic"""
@@ -347,6 +611,14 @@ def expand_with_pytrends(seed: str, k=8) -> list[str]:
     except Exception:
         return []
 
+def _adaptive_pages(seed_result_count: int) -> int:
+    # crude heuristic—tune freely
+    if seed_result_count >= 200: return min(NEWSAPI_MAX_PAGES, 10)
+    if seed_result_count >= 100: return min(NEWSAPI_MAX_PAGES, 6)
+    if seed_result_count >= 50:  return min(NEWSAPI_MAX_PAGES, 4)
+    return min(NEWSAPI_MAX_PAGES, 2)
+
+
 # Optional: LLM-driven expansions (DeepSeek)
 def expand_with_llm(seed: str, n=12) -> list[str]:
     try:
@@ -391,28 +663,37 @@ def save_trending_topics(topics: List[str]):
     except Exception as e:
         print(f"Error saving trending topics: {str(e)}")
 
-def process_topic_batch(queries: List[str], window_name: str = "default"):
-    """Process a batch of pre-composed query strings with proper rate limiting"""
+def process_topic_batch(queries: List[Tuple[str, str]], window_name: str = "default"):
+    """
+    Process a batch of pre-composed (category, query) pairs with proper rate limiting.
+    """
     print(f"Processing {len(queries)} queries in {window_name} window")
 
     all_content = []
     reddit_client = setup_reddit_client()
 
-    for i, q in enumerate(queries):
-        print(f"Processing query {i+1}/{len(queries)}: {q}")
+    for i, (cat, q) in enumerate(queries):
+        print(f"Processing query {i+1}/{len(queries)}: [{cat}] {q}")
 
-        # 1) News: favor diversity (pageSize=100, max_pages=NEWSAPI_MAX_PAGES)
+        # 1) News
         articles = get_newsapi_articles(
             q,
             page_size=min(100, CONFIG["max_items_per_topic"]),
             max_pages=NEWSAPI_MAX_PAGES,
             search_in="title,description"
         )
+
+        # attach query_category and taxonomy labels
+        for a in articles:
+            a["query"] = q
+            a["query_category"] = cat
+            a["categories"] = label_categories_from_taxonomy(a.get("title",""), a.get("description",""), a.get("content",""))
+
         all_content.extend(articles)
         print(f"Found {len(articles)} news articles for query: {q}")
         time.sleep(CONFIG["newsapi_delay"])
 
-        # 2) Reddit: split budget between 'top' and 'new' in a 1-week window, then dedup
+        # 2) Reddit (if client available)
         if reddit_client:
             per_sub_total = max(1, CONFIG["max_items_per_topic"] // max(1, len(CONFIG["subreddits_to_monitor"])))
             per_mode = max(1, per_sub_total // 2)
@@ -425,7 +706,12 @@ def process_topic_batch(queries: List[str], window_name: str = "default"):
                 for p in posts:
                     pid = p.get("post_id")
                     if pid and pid not in seen:
-                        seen.add(pid); dedup.append(p)
+                        seen.add(pid)
+                        # attach query_category and taxonomy labels
+                        p["query"] = q
+                        p["query_category"] = cat
+                        p["categories"] = label_categories_from_taxonomy(p.get("title",""), p.get("content",""), "")
+                        dedup.append(p)
                 all_content.extend(dedup)
                 print(f"Found {len(dedup)} Reddit posts in r/{subreddit} for query: {q}")
                 time.sleep(CONFIG["reddit_delay_between_subreddits"])
@@ -433,6 +719,10 @@ def process_topic_batch(queries: List[str], window_name: str = "default"):
         # 3) Twitter (optional)
         if CONFIG["enable_twitter"]:
             tweets = get_twitter_posts(q, limit=max(1, CONFIG["max_items_per_topic"] // 4))
+            for t in tweets:
+                t["query"] = q
+                t["query_category"] = cat
+                t["categories"] = label_categories_from_taxonomy("", t.get("content",""), "")
             all_content.extend(tweets)
             print(f"Found {len(tweets)} tweets for query: {q}")
 
@@ -441,15 +731,17 @@ def process_topic_batch(queries: List[str], window_name: str = "default"):
     return all_content
 
 
+
 def daily_collection_job():
     """Main job to run daily content collection"""
-    print(f"Starting daily content gathering at {datetime.datetime.now().isoformat()}")
-    
-    # Load previous trending topics to expand our search
-    previous_topics = load_previous_topics()
-    base_seeds = SEED_TOPICS + previous_topics
+    now = datetime.datetime.now()
+    print(f"Starting daily content gathering at {now.isoformat()}")
 
-    # Dynamic expansions → a set of distinct query strings
+    # 1) Seeds + previous trending
+    previous_topics = load_previous_topics()
+    base_seeds = list(dict.fromkeys(SEED_TOPICS + previous_topics))
+
+    # 2) Dynamic expansions from recent dumps
     exp = dynamic_expand_topics(
         base_seeds,
         recent_items_json_glob=str(DATA_DIR / "content_*.json"),
@@ -458,60 +750,85 @@ def daily_collection_job():
         use_llm=False
     )
 
-    # Flatten and interleave: each seed’s own query + its expansions as separate queries
-    all_queries = []
+    # 3) Assemble (category, query) pairs:
+    #    - taxonomy include terms with NOT-excludes
+    #    - seed queries
+    #    - expansion queries (tagged as 'seed_expansion')
+    pairs: List[Tuple[str, str]] = []
+    pairs += taxonomy_queries()
+    pairs += seed_queries(base_seeds)
     for s in base_seeds:
-        all_queries.append(f'"{s}"')  # the seed itself as a query
         for e in exp.get(s, []):
-            all_queries.append(f'"{e}"')
+            pairs.append(("seed_expansion", f'"{e}"'))
 
-    # Dedup and cap to your daily budget
-    all_queries = list(dict.fromkeys(all_queries))[:CONFIG["max_topics_per_day"]]
+    # Deduplicate on query string, keep first category
+    seen = set()
+    final_pairs: List[Tuple[str, str]] = []
+    for cat, q in pairs:
+        if q in seen:
+            continue
+        seen.add(q)
+        final_pairs.append((cat, q))
 
-    # Fallback if no expansions (still run seeds)
-    if not all_queries:
-        all_queries = [f'"{s}"' for s in base_seeds][:CONFIG["max_topics_per_day"]]
+    # Cap daily budget
+    final_pairs = final_pairs[:CONFIG["max_topics_per_day"]]
 
-    topics_to_process = all_queries
+    # Persist an audit trail of queries and expansions (optional but recommended)
+    try:
+        (DATA_DIR / f"queries_{now:%Y%m%d_%H%M%S}.json").write_text(
+            json.dumps({"queries": [{"category": c, "q": q} for c, q in final_pairs]}, indent=2)
+        )
+        (DATA_DIR / f"expansions_{now:%Y%m%d_%H%M%S}.json").write_text(
+            json.dumps(exp, indent=2)
+        )
+    except Exception as e:
+        print(f"[audit] failed to write queries/expansions: {e}")
+
+    topics_to_process = final_pairs
     print(f"Processing {len(topics_to_process)} queries today")
 
-    
+    # 4) Process in time windows and SAVE each window batch
     all_content = []
-    
-    # Process topics in batches based on collection windows
+
     for i, window in enumerate(CONFIG["collection_windows"]):
         current_hour = datetime.datetime.now().hour
-        
-        # Check if we should process this window now
-        if current_hour >= window["start_hour"] and current_hour < window["start_hour"] + window["duration_hours"]:
-            print(f"Starting collection window {i+1} (hours {window['start_hour']}-{window['start_hour'] + window['duration_hours']})")
-            
-            # Calculate which topics to process in this window
-            topics_per_window = CONFIG["max_topics_per_day"] // len(CONFIG["collection_windows"])
+        start_h = window["start_hour"]; end_h = start_h + window["duration_hours"]
+        if start_h <= current_hour < end_h:
+            print(f"Starting collection window {i+1} (hours {start_h}-{end_h})")
+
+            # slice queries for this window
+            topics_per_window = max(1, CONFIG["max_topics_per_day"] // max(1, len(CONFIG["collection_windows"])))
             start_idx = i * topics_per_window
             end_idx = min(start_idx + topics_per_window, len(topics_to_process))
-            window_topics = topics_to_process[start_idx:end_idx]
-            
-            # Process this batch of topics
-            content_batch = process_topic_batch(window_topics, f"window_{i+1}")
+            window_pairs = topics_to_process[start_idx:end_idx]
+
+            # actually collect
+            content_batch = process_topic_batch(window_pairs, window_name=f"window_{i+1}")
+
+            # de-dupe this batch and append to global (then de-dupe global)
+            content_batch = _dedup_items(content_batch)
             all_content.extend(content_batch)
-            
-            # Save intermediate results
+            all_content = _dedup_items(all_content)
+
+            # save the window to disk
             output_filename = f"content_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_window_{i+1}.json"
             output_path = DATA_DIR / output_filename
-            with open(output_path, 'w') as f:
-                json.dump({
-                    'metadata': {
-                        'gathered_at': datetime.datetime.now().isoformat(),
-                        'content_count': len(content_batch),
-                        'topics_used': window_topics
-                    },
-                    'content': content_batch
-                }, f, indent=2)
-            
-            print(f"Saved {len(content_batch)} items from window {i+1}")
-    
-    # 5. Extract trending topics from today's content for tomorrow's search
+            try:
+                with open(output_path, 'w') as f:
+                    json.dump({
+                        'metadata': {
+                            'gathered_at': datetime.datetime.now().isoformat(),
+                            'content_count': len(content_batch),
+                            'topics_used': [q for (_, q) in window_pairs],
+                            'topic_categories_used': [c for (c, _) in window_pairs]
+                        },
+                        'content': content_batch
+                    }, f, indent=2)
+                print(f"Saved {len(content_batch)} items from window {i+1} -> {output_path}")
+            except Exception as e:
+                print(f"Failed to write window {i+1} output: {e}")
+
+    # 5) Trending topics for tomorrow (unchanged)
     word_freq = defaultdict(int)
     for item in all_content:
         text = f"{item.get('title', '')} {item.get('content', '')}"
@@ -519,14 +836,15 @@ def daily_collection_job():
         for word in words:
             if len(word) > 5 and word not in ['http', 'https']:
                 word_freq[word] += 1
-    
+
     trending_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:10]
     trending_topics = [word for word, count in trending_words]
-    
+
     save_trending_topics(trending_topics)
     print(f"Saved {len(trending_topics)} trending topics for next search")
-    
+
     print(f"Daily collection complete. Gathered {len(all_content)} total items.")
+
 
 def dynamic_expand_topics(seeds: list[str], recent_items_json_glob: str, per_seed=6, use_pytrends=True, use_llm=False) -> dict[str,list[str]]:
     # Load yesterday/today items to learn co-phrases 
@@ -556,16 +874,6 @@ def dynamic_expand_topics(seeds: list[str], recent_items_json_glob: str, per_see
         cleaned = list(dict.fromkeys(cleaned))[:max(1,per_seed)]
         expanded[seed] = cleaned
     return expanded
-
-def build_news_queries(seed: str, expansions: list[str]) -> list[str]:
-    # Build NewsAPI queries that bias to titles but stay generic (no hand-crafted OR lists)
-    qs = []
-    # the seed itself
-    qs.append(f'"{seed}"')
-    # each expansion as its own query (more diversity, better than paging on a single query)
-    for e in expansions:
-        qs.append(f'"{e}"')
-    return qs
 
 # ================= SCHEDULING =================
 def schedule_daily_collection():
