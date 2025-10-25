@@ -1,6 +1,6 @@
 import os
 import json
-import datetime
+import datetime as dt
 import time
 import requests
 import praw
@@ -382,8 +382,8 @@ def get_newsapi_articles(
     if from_dt:
         from_param = _iso_z(from_dt)
     else:
-        now = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
-        from_param = (now - datetime.timedelta(hours=from_hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        now = dt.datetime.utcnow().replace(tzinfo=timezone.utc)
+        from_param = (now - dt.timedelta(hours=from_hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     to_param = _iso_z(to_dt) if to_dt else None
 
@@ -518,7 +518,7 @@ def get_reddit_posts(reddit_client, subreddit_name: str, topic: str, time_filter
             print("Rate limit detected. Waiting 120 seconds before continuing...")
             time.sleep(120)
     
-    return tweets
+    return posts
 
 def get_twitter_posts(query: str, since_days: int = 1, limit: int = 50) -> List[Dict[str, Any]]:
     """Fetch tweets using snscrape with improved error handling"""
@@ -526,7 +526,7 @@ def get_twitter_posts(query: str, since_days: int = 1, limit: int = 50) -> List[
         return []
         
     tweets = []
-    since_date = (datetime.datetime.now() - datetime.timedelta(days=since_days)).strftime('%Y-%m-%d')
+    since_date = (dt.datetime.now() - dt.timedelta(days=since_days)).strftime('%Y-%m-%d')
     
     try:
         search_query = f"{query} since:{since_date}"
@@ -701,7 +701,7 @@ def save_trending_topics(topics: List[str]):
         # Change this line:
         topics_file = DATA_DIR / 'trending_topics.json'  # Updated path
         with open(topics_file, 'w') as f:
-            json.dump({'topics': topics, 'last_updated': datetime.datetime.now().isoformat()}, f)
+            json.dump({'topics': topics, 'last_updated': dt.datetime.now().isoformat()}, f)
     except Exception as e:
         print(f"Error saving trending topics: {str(e)}")
 
@@ -790,7 +790,7 @@ def daily_collection_job(start_dt: datetime | None = None,
                          end_dt: datetime | None = None,
                          from_hours: int | None = None):
     """Main job to run daily content collection"""
-    now = datetime.datetime.now()
+    now = dt.datetime.now()
     print(f"Starting daily content gathering at {now.isoformat()}")
 
     # 1) Seeds + previous trending
@@ -856,13 +856,13 @@ def daily_collection_job(start_dt: datetime | None = None,
         all_content.extend(content_batch)
         all_content = _dedup_items(all_content)
 
-        output_filename = f"content_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_ad_hoc.json"
+        output_filename = f"content_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_ad_hoc.json"
         output_path = DATA_DIR / output_filename
         try:
             with open(output_path, 'w') as f:
                 json.dump({
                     'metadata': {
-                        'gathered_at': datetime.datetime.now().isoformat(),
+                        'gathered_at': dt.datetime.now().isoformat(),
                         'content_count': len(content_batch),
                         'topics_used': [q for (_, q) in topics_to_process],
                         'topic_categories_used': [c for (c, _) in topics_to_process],
@@ -879,7 +879,7 @@ def daily_collection_job(start_dt: datetime | None = None,
     else:
         # ORIGINAL windowed behavior
         for i, window in enumerate(CONFIG["collection_windows"]):
-            current_hour = datetime.datetime.now().hour
+            current_hour = dt.datetime.now().hour
             start_h = window["start_hour"]; end_h = start_h + window["duration_hours"]
             if start_h <= current_hour < end_h:
                 print(f"Starting collection window {i+1} (hours {start_h}-{end_h})")
@@ -897,13 +897,13 @@ def daily_collection_job(start_dt: datetime | None = None,
                 all_content.extend(content_batch)
                 all_content = _dedup_items(all_content)
 
-                output_filename = f"content_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_window_{i+1}.json"
+                output_filename = f"content_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_window_{i+1}.json"
                 output_path = DATA_DIR / output_filename
                 try:
                     with open(output_path, 'w') as f:
                         json.dump({
                             'metadata': {
-                                'gathered_at': datetime.datetime.now().isoformat(),
+                                'gathered_at': dt.datetime.now().isoformat(),
                                 'content_count': len(content_batch),
                                 'topics_used': [q for (_, q) in window_pairs],
                                 'topic_categories_used': [c for (c, _) in window_pairs]
@@ -1000,7 +1000,7 @@ if __name__ == "__main__" and os.environ.get("RUN_COLLECTOR_TEST") == "1":
         "max_items_per_topic": 15,
         "subreddits_to_monitor": ["politics", "Conservative", "PoliticalDiscussion"],
         "collection_windows": [
-            {"start_hour": datetime.datetime.now().hour, "duration_hours": 2, "topics": 8},
+            {"start_hour": dt.datetime.now().hour, "duration_hours": 2, "topics": 8},
         ],
         "reddit_delay_between_requests": 5,
         "reddit_delay_between_topics": 3.0,
