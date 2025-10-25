@@ -46,7 +46,7 @@ REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'PoliticalFundraisingScraper/
 # ================= CONFIGURATION PARAMETERS =================
 # Adjust these values to control the scale of data collection
 CONFIG = {
-    "max_topics_per_day": 60,          # Maximum topics to process daily
+    "max_topics_per_day": 200,          # Maximum topics to process daily
     "max_items_per_topic": 20,         # Maximum items to collect per topic
     "subreddits_to_monitor": ["politics", "Conservative", "PoliticalDiscussion"],
     "collection_windows": [            # Spread collection across the day
