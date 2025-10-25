@@ -275,6 +275,22 @@ newsapi_limiter = RateLimiter(NEWSAPI_RPM)
 
 # ================= CORE FUNCTIONS =================
 
+def _daterange_chunks(start_dt: datetime, end_dt: datetime, days: int = 3):
+    """Yield (chunk_start, chunk_end) in [start, end) with chunk size in days."""
+    cur = start_dt
+    one_day = dt.timedelta(days=1)
+    step = dt.timedelta(days=max(1, days))
+    while cur < end_dt:
+        nxt = min(cur + step, end_dt)
+        yield cur, nxt
+        cur = nxt
+
+def _window_days(start_dt: datetime | None, end_dt: datetime | None) -> int:
+    if not start_dt or not end_dt:
+        return 0
+    return max(1, int((end_dt - start_dt).total_seconds() // 86400))
+
+
 def _parse_date_utc(s: str | None) -> datetime | None:
     if not s: return None
     # Accept YYYY-MM-DD or full ISO
@@ -723,36 +739,90 @@ def process_topic_batch(
     for i, (cat, q) in enumerate(queries):
         print(f"Processing query {i+1}/{len(queries)}: [{cat}] {q}")
 
-        # 1) News
-        articles = get_newsapi_articles(
-            q,
-            page_size=min(100, CONFIG["max_items_per_topic"]),
-            max_pages=NEWSAPI_MAX_PAGES,
-            search_in="title,description",
-            from_dt=start_dt,
-            to_dt=end_dt,
-            from_hours=(from_hours if from_hours is not None else 72),
-        )
+        # 1) News — chunk the window to avoid recency bias / per-query caps
+        news_items = []
+        if start_dt and end_dt:
+            # Heuristic: 2–3 day chunks for 2–6 week windows; 1 day if very long and you want max recall
+            days = 3 if _window_days(start_dt, end_dt) <= 45 else 2
+            for ch_start, ch_end in _daterange_chunks(start_dt, end_dt, days=days):
+                arts = get_newsapi_articles(
+                    q,
+                    page_size=min(100, CONFIG["max_items_per_topic"]),
+                    max_pages=NEWSAPI_MAX_PAGES,
+                    search_in="title,description",
+                    from_dt=ch_start,
+                    to_dt=ch_end,
+                    from_hours=(from_hours if from_hours is not None else 72),
+                )
+                for a in arts:
+                    a["query"] = q
+                    a["query_category"] = cat
+                    a["categories"] = label_categories_from_taxonomy(
+                        a.get("title",""), a.get("description",""), a.get("content","")
+                    )
+                news_items.extend(arts)
+                # be nice to the API
+                time.sleep(CONFIG["newsapi_delay"])
+        else:
+            arts = get_newsapi_articles(
+                q,
+                page_size=min(100, CONFIG["max_items_per_topic"]),
+                max_pages=NEWSAPI_MAX_PAGES,
+                search_in="title,description",
+                from_dt=None,
+                to_dt=None,
+                from_hours=(from_hours if from_hours is not None else 72),
+            )
+            for a in arts:
+                a["query"] = q
+                a["query_category"] = cat
+                a["categories"] = label_categories_from_taxonomy(
+                    a.get("title",""), a.get("description",""), a.get("content","")
+                )
+            news_items.extend(arts)
 
+        # de-dup and append
+        news_items = _dedup_items(news_items)
+        all_content.extend(news_items)
+        print(f"Found {len(news_items)} news articles for query: {q}")
 
-        # attach query_category and taxonomy labels
-        for a in articles:
-            a["query"] = q
-            a["query_category"] = cat
-            a["categories"] = label_categories_from_taxonomy(a.get("title",""), a.get("description",""), a.get("content",""))
-
-        all_content.extend(articles)
-        print(f"Found {len(articles)} news articles for query: {q}")
         time.sleep(CONFIG["newsapi_delay"])
 
         # 2) Reddit (if client available)
         if reddit_client:
             per_sub_total = max(1, CONFIG["max_items_per_topic"] // max(1, len(CONFIG["subreddits_to_monitor"])))
             per_mode = max(1, per_sub_total // 2)
+
+            # Pick a time_filter based on requested window length
+            tf = "day"
+            wd = _window_days(start_dt, end_dt)
+            if wd >= 30:
+                tf = "year"
+            elif wd >= 7:
+                tf = "month"
+            elif wd >= 2:
+                tf = "week"
+
             for subreddit in CONFIG["subreddits_to_monitor"]:
                 posts = []
-                for mode in [("top","week"), ("new","week")]:
+                for mode in [("top", tf), ("new", tf)]:
                     posts += get_reddit_posts(reddit_client, subreddit, q, time_filter=mode[1], limit=per_mode)
+                # filter + dedup
+                seen = set(); dedup = []
+                for p in posts:
+                    if (start_dt or end_dt) and (not _within_window(p.get("published_at"), start_dt, end_dt)):
+                        continue
+                    pid = p.get("post_id")
+                    if pid and pid not in seen:
+                        seen.add(pid)
+                        p["query"] = q
+                        p["query_category"] = cat
+                        p["categories"] = label_categories_from_taxonomy(p.get("title",""), p.get("content",""), "")
+                        dedup.append(p)
+                all_content.extend(dedup)
+                print(f"Found {len(dedup)} Reddit posts in r/{subreddit} for query: {q} (tf={tf})")
+                time.sleep(CONFIG["reddit_delay_between_subreddits"])
+
                 # dedup by post_id
                 seen = set(); dedup = []
                 for p in posts:
@@ -985,6 +1055,10 @@ if __name__ == "__main__" and os.environ.get("RUN_COLLECTOR_ARGS") == "1":
 
     start_dt = _parse_date_utc(args.start)
     end_dt   = _parse_date_utc(args.end)
+
+    # If end was a date-only token (00:00), shift to next midnight to make it inclusive
+    if end_dt and end_dt.time() == dt.time(0,0):
+        end_dt = end_dt + dt.timedelta(days=1)
 
     daily_collection_job(start_dt=start_dt, end_dt=end_dt, from_hours=args.from_hours)
     raise SystemExit(0)
