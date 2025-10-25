@@ -17,6 +17,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from glob import glob
 import numpy as np
 from typing import Tuple
+from datetime import datetime, timezone
 
 # Calculate the path to the .env file
 current_dir = Path(__file__).parent
@@ -274,6 +275,30 @@ newsapi_limiter = RateLimiter(NEWSAPI_RPM)
 
 # ================= CORE FUNCTIONS =================
 
+def _parse_date_utc(s: str | None) -> datetime | None:
+    if not s: return None
+    # Accept YYYY-MM-DD or full ISO
+    try:
+        if len(s) == 10:
+            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(s)
+    except Exception:
+        # last resort
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            raise SystemExit(f"Invalid date: {s} (use YYYY-MM-DD or ISO8601)")
+
+def _within_window(ts_utc: float | int | None, start_dt: datetime | None, end_dt: datetime | None) -> bool:
+    if ts_utc is None:
+        return False
+    t = datetime.fromtimestamp(float(ts_utc), tz=timezone.utc)
+    if start_dt and t < start_dt:
+        return False
+    if end_dt and t >= end_dt:
+        return False
+    return True
+
 def taxonomy_queries() -> List[Tuple[str, str]]:
     """
     Build (category, query) pairs from TOPIC_TAXONOMY using include terms
@@ -336,9 +361,11 @@ def get_newsapi_articles(
     page_size: int = None,
     max_pages: int = None,
     search_in="title,description",
-    from_hours: int = 72,        # recency window
+    from_hours: int = 72,        # fallback if from_dt not provided
     language: str = "en",
-    sort_by: str = "publishedAt"
+    sort_by: str = "publishedAt",
+    from_dt: datetime | None = None,
+    to_dt: datetime | None = None,
 ) -> List[Dict[str, Any]]:
 
     page_size = page_size or NEWSAPI_PAGE_SIZE
@@ -346,8 +373,20 @@ def get_newsapi_articles(
 
     articles = []
     base_url = "https://newsapi.org/v2/everything"
-    now = datetime.datetime.utcnow()
-    from_param = (now - datetime.timedelta(hours=from_hours)).isoformat(timespec="seconds") + "Z"
+
+    def _iso_z(dt: datetime) -> str:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    if from_dt:
+        from_param = _iso_z(from_dt)
+    else:
+        now = datetime.datetime.utcnow().replace(tzinfo=timezone.utc)
+        from_param = (now - datetime.timedelta(hours=from_hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    to_param = _iso_z(to_dt) if to_dt else None
+
 
     page = 1
     consecutive_empty = 0
@@ -358,7 +397,7 @@ def get_newsapi_articles(
 
         params = {
             "q": query,
-            "searchIn": search_in,    # supported by many paid tiers
+            "searchIn": search_in,
             "sortBy": sort_by,
             "apiKey": NEWSAPI_KEY,
             "pageSize": page_size,
@@ -366,6 +405,9 @@ def get_newsapi_articles(
             "language": language,
             "from": from_param,
         }
+        if to_param:
+            params["to"] = to_param
+
 
         try:
             resp = requests.get(base_url, params=params, timeout=20)
@@ -476,7 +518,7 @@ def get_reddit_posts(reddit_client, subreddit_name: str, topic: str, time_filter
             print("Rate limit detected. Waiting 120 seconds before continuing...")
             time.sleep(120)
     
-    return posts
+    return tweets
 
 def get_twitter_posts(query: str, since_days: int = 1, limit: int = 50) -> List[Dict[str, Any]]:
     """Fetch tweets using snscrape with improved error handling"""
@@ -663,7 +705,13 @@ def save_trending_topics(topics: List[str]):
     except Exception as e:
         print(f"Error saving trending topics: {str(e)}")
 
-def process_topic_batch(queries: List[Tuple[str, str]], window_name: str = "default"):
+def process_topic_batch(
+    queries: List[Tuple[str, str]],
+    window_name: str = "default",
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    from_hours: int | None = None,
+):
     """
     Process a batch of pre-composed (category, query) pairs with proper rate limiting.
     """
@@ -680,8 +728,12 @@ def process_topic_batch(queries: List[Tuple[str, str]], window_name: str = "defa
             q,
             page_size=min(100, CONFIG["max_items_per_topic"]),
             max_pages=NEWSAPI_MAX_PAGES,
-            search_in="title,description"
+            search_in="title,description",
+            from_dt=start_dt,
+            to_dt=end_dt,
+            from_hours=(from_hours if from_hours is not None else 72),
         )
+
 
         # attach query_category and taxonomy labels
         for a in articles:
@@ -704,10 +756,12 @@ def process_topic_batch(queries: List[Tuple[str, str]], window_name: str = "defa
                 # dedup by post_id
                 seen = set(); dedup = []
                 for p in posts:
+                    # drop outside window if a window is set
+                    if (start_dt or end_dt) and (not _within_window(p.get("published_at"), start_dt, end_dt)):
+                        continue
                     pid = p.get("post_id")
                     if pid and pid not in seen:
                         seen.add(pid)
-                        # attach query_category and taxonomy labels
                         p["query"] = q
                         p["query_category"] = cat
                         p["categories"] = label_categories_from_taxonomy(p.get("title",""), p.get("content",""), "")
@@ -732,7 +786,9 @@ def process_topic_batch(queries: List[Tuple[str, str]], window_name: str = "defa
 
 
 
-def daily_collection_job():
+def daily_collection_job(start_dt: datetime | None = None,
+                         end_dt: datetime | None = None,
+                         from_hours: int | None = None):
     """Main job to run daily content collection"""
     now = datetime.datetime.now()
     print(f"Starting daily content gathering at {now.isoformat()}")
@@ -787,46 +843,77 @@ def daily_collection_job():
     topics_to_process = final_pairs
     print(f"Processing {len(topics_to_process)} queries today")
 
-    # 4) Process in time windows and SAVE each window batch
+    # 4) Process (ad-hoc if dates/hours provided, else windowed)
     all_content = []
 
-    for i, window in enumerate(CONFIG["collection_windows"]):
-        current_hour = datetime.datetime.now().hour
-        start_h = window["start_hour"]; end_h = start_h + window["duration_hours"]
-        if start_h <= current_hour < end_h:
-            print(f"Starting collection window {i+1} (hours {start_h}-{end_h})")
+    # If a date window or relative hours is provided: run once immediately
+    if start_dt or end_dt or (from_hours is not None):
+        content_batch = process_topic_batch(
+            topics_to_process, window_name="ad_hoc",
+            start_dt=start_dt, end_dt=end_dt, from_hours=from_hours
+        )
+        content_batch = _dedup_items(content_batch)
+        all_content.extend(content_batch)
+        all_content = _dedup_items(all_content)
 
-            # slice queries for this window
-            topics_per_window = max(1, CONFIG["max_topics_per_day"] // max(1, len(CONFIG["collection_windows"])))
-            start_idx = i * topics_per_window
-            end_idx = min(start_idx + topics_per_window, len(topics_to_process))
-            window_pairs = topics_to_process[start_idx:end_idx]
+        output_filename = f"content_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_ad_hoc.json"
+        output_path = DATA_DIR / output_filename
+        try:
+            with open(output_path, 'w') as f:
+                json.dump({
+                    'metadata': {
+                        'gathered_at': datetime.datetime.now().isoformat(),
+                        'content_count': len(content_batch),
+                        'topics_used': [q for (_, q) in topics_to_process],
+                        'topic_categories_used': [c for (c, _) in topics_to_process],
+                        'start_dt': start_dt.isoformat() if start_dt else None,
+                        'end_dt': end_dt.isoformat() if end_dt else None,
+                        'from_hours': from_hours
+                    },
+                    'content': content_batch
+                }, f, indent=2)
+            print(f"Saved {len(content_batch)} items (ad-hoc) -> {output_path}")
+        except Exception as e:
+            print(f"Failed to write ad-hoc output: {e}")
 
-            # actually collect
-            content_batch = process_topic_batch(window_pairs, window_name=f"window_{i+1}")
+    else:
+        # ORIGINAL windowed behavior
+        for i, window in enumerate(CONFIG["collection_windows"]):
+            current_hour = datetime.datetime.now().hour
+            start_h = window["start_hour"]; end_h = start_h + window["duration_hours"]
+            if start_h <= current_hour < end_h:
+                print(f"Starting collection window {i+1} (hours {start_h}-{end_h})")
 
-            # de-dupe this batch and append to global (then de-dupe global)
-            content_batch = _dedup_items(content_batch)
-            all_content.extend(content_batch)
-            all_content = _dedup_items(all_content)
+                topics_per_window = max(1, CONFIG["max_topics_per_day"] // max(1, len(CONFIG["collection_windows"])))
+                start_idx = i * topics_per_window
+                end_idx = min(start_idx + topics_per_window, len(topics_to_process))
+                window_pairs = topics_to_process[start_idx:end_idx]
 
-            # save the window to disk
-            output_filename = f"content_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_window_{i+1}.json"
-            output_path = DATA_DIR / output_filename
-            try:
-                with open(output_path, 'w') as f:
-                    json.dump({
-                        'metadata': {
-                            'gathered_at': datetime.datetime.now().isoformat(),
-                            'content_count': len(content_batch),
-                            'topics_used': [q for (_, q) in window_pairs],
-                            'topic_categories_used': [c for (c, _) in window_pairs]
-                        },
-                        'content': content_batch
-                    }, f, indent=2)
-                print(f"Saved {len(content_batch)} items from window {i+1} -> {output_path}")
-            except Exception as e:
-                print(f"Failed to write window {i+1} output: {e}")
+                content_batch = process_topic_batch(
+                    window_pairs, window_name=f"window_{i+1}",
+                    start_dt=None, end_dt=None, from_hours=None
+                )
+                content_batch = _dedup_items(content_batch)
+                all_content.extend(content_batch)
+                all_content = _dedup_items(all_content)
+
+                output_filename = f"content_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_window_{i+1}.json"
+                output_path = DATA_DIR / output_filename
+                try:
+                    with open(output_path, 'w') as f:
+                        json.dump({
+                            'metadata': {
+                                'gathered_at': datetime.datetime.now().isoformat(),
+                                'content_count': len(content_batch),
+                                'topics_used': [q for (_, q) in window_pairs],
+                                'topic_categories_used': [c for (c, _) in window_pairs]
+                            },
+                            'content': content_batch
+                        }, f, indent=2)
+                    print(f"Saved {len(content_batch)} items from window {i+1} -> {output_path}")
+                except Exception as e:
+                    print(f"Failed to write window {i+1} output: {e}")
+
 
     # 5) Trending topics for tomorrow (unchanged)
     word_freq = defaultdict(int)
@@ -887,34 +974,47 @@ def schedule_daily_collection():
         schedule.run_pending()
         time.sleep(60)  # Check every minute
 
+if __name__ == "__main__" and os.environ.get("RUN_COLLECTOR_ARGS") == "1":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", help="UTC date start (YYYY-MM-DD or ISO)", default=None)
+    ap.add_argument("--end",   help="UTC date end   (YYYY-MM-DD or ISO, exclusive if time given)", default=None)
+    ap.add_argument("--from-hours", type=int, default=None,
+                    help="Relative window (hours) if you don't pass --start/--end")
+    args = ap.parse_args()
 
-if __name__ == "__main__":
+    start_dt = _parse_date_utc(args.start)
+    end_dt   = _parse_date_utc(args.end)
+
+    daily_collection_job(start_dt=start_dt, end_dt=end_dt, from_hours=args.from_hours)
+    raise SystemExit(0)
+
+
+if __name__ == "__main__" and os.environ.get("RUN_COLLECTOR_TEST") == "1":
     print("=" * 60)
     print("STARTING TEST RUN WITH MINIMAL CONFIGURATION")
     print("=" * 60)
-    
-    # Temporary test configuration - minimal settings for quick verification
+
     TEST_CONFIG = {
-        "max_topics_per_day": 40,           # Increased from 3 to 8
-        "max_items_per_topic": 15,         # Increased from 5 to 10
-        "subreddits_to_monitor": ["politics", "Conservative", "PoliticalDiscussion"],  # Added more subreddits
+        "max_topics_per_day": 40,
+        "max_items_per_topic": 15,
+        "subreddits_to_monitor": ["politics", "Conservative", "PoliticalDiscussion"],
         "collection_windows": [
             {"start_hour": datetime.datetime.now().hour, "duration_hours": 2, "topics": 8},
         ],
-        "reddit_delay_between_requests": 5,  # Slightly longer delays
+        "reddit_delay_between_requests": 5,
         "reddit_delay_between_topics": 3.0,
         "reddit_delay_between_subreddits": 4.0,
         "newsapi_delay": 1.0,
         "max_retries": 2,
         "enable_twitter": False,
     }
-    
-    # Temporarily replace the main config with test config
+
     original_config = CONFIG.copy()
     CONFIG.update(TEST_CONFIG)
-    
-    # Run the collection job immediately
+
     try:
+        # test run uses default windowed mode
         daily_collection_job()
         print("=" * 60)
         print("TEST RUN COMPLETED SUCCESSFULLY!")
@@ -923,6 +1023,5 @@ if __name__ == "__main__":
         print(f"TEST RUN FAILED WITH ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
-    
-    # Restore original configuration
-    CONFIG.update(original_config)
+    finally:
+        CONFIG.update(original_config)
