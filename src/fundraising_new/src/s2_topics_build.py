@@ -233,7 +233,7 @@ def build_daily_snapshot(day: str,
               .merge(meta, on="cluster_id", how="left"))
 
     # accepted gates (match your topics_build acceptance)
-    acc = tall[(tall["us_relevance"]) &
+    acc = tall[(tall["fundraising_us_relevance"]) &
                (tall["fundraising_usable"]) &
                (pd.to_numeric(tall["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
 
@@ -688,6 +688,13 @@ def main():
         ascending=[False,False,False]
     )
 
+    need = {"cluster_id","fundraising_us_relevance","fundraising_usable","fundraising_score",
+            "fundraising_label","fundraising_party_lean","fundraising_rationale",
+            "voting_us_relevance","voting_usable","voting_score"}
+    missing = need - set(meta.columns)
+    if missing:
+        raise RuntimeError(f"[meta] missing expected columns: {sorted(missing)}")
+
     meta.to_parquet(outdir / "cluster_meta.parquet", index=False)
     print(f"✓ wrote {outdir/'cluster_meta.parquet'} clusters={len(meta)}")
 
@@ -772,21 +779,36 @@ def main():
                         return
 
                     # Update this line to include voting metrics in the snapshot:
-                    joined = (it.merge(clusters_df, on="item_id", how="inner")
-                                .merge(meta_act[["cluster_id","fundraising_label","fundraising_party_lean",
-                                            "fundraising_score","voting_score","fundraising_rationale"]],  # Use prefixed
-                                    on="cluster_id", how="inner"))
+                    # active clusters that day
+                    act = (it.merge(clusters_df, on="item_id", how="inner")
+                            [["cluster_id","item_id","cluster_prob"]]
+                            .drop_duplicates("item_id"))
 
-                    rep = (joined.sort_values(["cluster_prob","published_at"], ascending=[False, True])
+                    meta_act = meta_set.merge(act[["cluster_id"]].drop_duplicates(), on="cluster_id", how="inner")
+                    if meta_act.empty:
+                        print(f"[snapshot{suffix}] no clusters active on {snap_date}")
+                        return
+
+                    # representatives (titles of the day)
+                    rep = (it.merge(clusters_df, on="item_id", how="inner")
+                            .merge(meta_act[["cluster_id"]], on="cluster_id", how="inner")
+                            .sort_values(["cluster_prob","published_at"], ascending=[False, True])
                             .groupby("cluster_id")["title"]
                             .apply(lambda s: " | ".join([str(t)[:140] for t in s.head(5) if str(t).strip()]))
                             .reset_index(name="rep_titles_day"))
 
-                    # Update this to include voting metrics:
-                    snap = (meta_act.merge(rep, on="cluster_id", how="left")
+                    # rename fundraising_* → generic names for snapshot
+                    meta_view = (meta_act.rename(columns={
+                                    "fundraising_label": "label",
+                                    "fundraising_party_lean": "party_lean",
+                                    "fundraising_rationale": "rationale"
+                                })
+                                [["cluster_id","label","party_lean","fundraising_score","voting_score","rationale"]])
+
+                    snap = (meta_view.merge(rep, on="cluster_id", how="left")
                             .assign(snapshot_date=snap_date)
                             [["snapshot_date","cluster_id","label","party_lean",
-                            "fundraising_score","voting_score","rep_titles_day","rationale"]])  # ADD voting_score
+                            "fundraising_score","voting_score","rep_titles_day","rationale"]])
 
                     # label_key + topics (if available)
                     snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
@@ -797,10 +819,12 @@ def main():
                     snap.to_parquet(out_file, index=False)
                     print(f"[snapshot{suffix}] wrote {out_file} rows={len(snap)}")
 
+
                 # meta sets
-                meta_accepted = meta[(meta["us_relevance"]) &
-                                    (meta["fundraising_usable"]) &
-                                    (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
+                meta_accepted = meta[(meta["fundraising_us_relevance"]) &
+                     (meta["fundraising_usable"]) &
+                     (pd.to_numeric(meta["fundraising_score"], errors="coerce").fillna(0) >= 60)].copy()
+
                 meta_all = meta.copy()
 
                 # write both snapshots
