@@ -389,7 +389,7 @@ def llm_verify_label_voting(snippets: List[str]) -> Dict[str, Any]:
     
     msg = [
         {"role":"system","content": "Return STRICT JSON only. No backticks, no markdown, no commentary."},
-        {"role":"user","content": VOTING_PROMPT.format(snips=snips)}
+        {"role":"user","content": VOTING_PROMPT.replace("{snips}", snips)}
     ]
     
     txt = deepseek_chat(msg)
@@ -529,7 +529,8 @@ def llm_verify_label(snippets: List[str]) -> Dict[str, Any]:
 
     msg = [
         {"role":"system","content": sys_msg},
-        {"role":"user","content": VERIFY_PROMPT.format(snips=snips)}
+        {"role":"user","content": VERIFY_PROMPT.replace("{snips}", snips)}
+
     ]
 
     txt = deepseek_chat(msg)
