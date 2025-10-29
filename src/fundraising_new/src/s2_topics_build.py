@@ -698,7 +698,9 @@ def main():
     # Combine both sets
     rel_cids = set(fundraising_rel["cluster_id"].tolist() + voting_rel["cluster_id"].tolist())
 
-    df_rel = df[df["cluster_id"].isin(rel_cids)].merge(rel[["cluster_id","label"]], on="cluster_id", how="left")
+    df_rel = (df[df["cluster_id"].isin(rel_cids)]
+          .merge(meta[["cluster_id","fundraising_label"]], on="cluster_id", how="left")
+          .rename(columns={"fundraising_label": "label"}))
     topic_events = (df_rel
         .assign(day=pd.to_datetime(df_rel["published_at"]).dt.date)
         .groupby(["day","label"], as_index=False)
