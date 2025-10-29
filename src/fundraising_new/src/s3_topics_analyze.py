@@ -310,12 +310,30 @@ def build_groups(items: pd.DataFrame,
     ]
     
     # Combine both sets of accepted clusters
-    accepted_clusters = pd.concat([fundraising_acc, voting_acc]).drop_duplicates()
+    accepted_clusters = pd.concat(
+        [fundraising_acc, voting_acc], ignore_index=True
+    )
+
+    # Dedup only by identifiers / scalar cols (tweak as needed)
+    subset = [c for c in ["cluster_id", "fundraising_label", "voting_label"] if c in accepted_clusters.columns]
+    if not subset:
+        subset = ["cluster_id"]
+    accepted_clusters = accepted_clusters.drop_duplicates(subset=subset, keep="last")
+
     
     df = (items[["item_id","title","source","url","published_at","text"]]
           .merge(clusters[["item_id","cluster_id","cluster_prob"]], on="item_id", how="inner")
           .merge(accepted_clusters, on="cluster_id", how="inner"))
     
+    # Prefer fundraising_label, else fall back to voting_label
+    f_lbl = df.get("fundraising_label")
+    v_lbl = df.get("voting_label")
+    df["label"] = (
+        f_lbl.astype(str).where(f_lbl.notna() & (f_lbl.astype(str).str.strip() != ""), v_lbl)
+        .fillna("")
+        .astype(str)
+)
+
     df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
     if start:
         df = df[df["published_at"] >= pd.to_datetime(start, utc=True)]
@@ -349,7 +367,7 @@ def score_group(label: str, snippets: List[str]) -> Dict[str, Any]:
     snips = "\n\n".join(snippets)
     
     # Get fundraising metrics
-    fundraising_prompt = VERIFY_PROMPT.format(snips=snips)
+    fundraising_prompt = VERIFY_PROMPT.replace("{snips}", snips)
     fundraising_messages = [
         {"role":"system","content":"You are a strict JSON scoring assistant for US political fundraising."},
         {"role":"user","content": fundraising_prompt}
@@ -358,7 +376,7 @@ def score_group(label: str, snippets: List[str]) -> Dict[str, Any]:
     fundraising_res = safe_json_load(fundraising_raw)
     
     # Get voting metrics  
-    voting_prompt = VOTING_PROMPT.format(snips=snips)
+    voting_prompt      = VOTING_PROMPT.replace("{snips}", snips)
     voting_messages = [
         {"role":"system","content":"You are a strict JSON scoring assistant for US political voter engagement."},
         {"role":"user","content": voting_prompt}
@@ -478,6 +496,10 @@ def main():
                             mode=args.by, start=args.start, end=args.end,
                             fundraising_threshold=args.fundraising_threshold,  # ← Correct parameter
                             voting_threshold=args.voting_threshold)             # ← Correct parameter
+    need = {"cluster_id","label","period"}
+    missing = need - set(df.columns)
+    if missing:
+        raise RuntimeError(f"[analyze] missing columns in groups: {sorted(missing)}")
 
     # build cache key per group
     cache_path = out_dir/"_cache_signatures.parquet"
