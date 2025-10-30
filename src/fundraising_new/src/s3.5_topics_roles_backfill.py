@@ -180,7 +180,7 @@ def main():
             
             msg = [
                 {"role":"system","content":"Return strict JSON only."},
-                {"role":"user","content": prompt_template.format(snips=snips)}
+                {"role":"user","content": prompt_template.replace("{snips}", snips)}
             ]
             try:
                 roles = parse_json(deepseek_chat(msg))
