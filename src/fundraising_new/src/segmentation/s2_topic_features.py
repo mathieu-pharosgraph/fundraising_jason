@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 import argparse, json, numpy as np, pandas as pd
 from pathlib import Path
+import sys
+from pathlib import Path as _P
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+
+from fundraising_new.src.utils.keys import nkey
 
 METRICS = Path("data/topics/metrics/topic_metrics.parquet")
 EVENTS  = Path("data/topics/topic_events.parquet")
@@ -68,7 +73,8 @@ def main():
 
     # Start with base columns
     X = df[base_columns].copy()
-    
+    X["label_key"] = X["label"].astype(str).map(nkey)
+
     # Process each context
     for context_name, col_map in context_configs:
         # Select columns for this context
@@ -102,10 +108,27 @@ def main():
 
     # events / items per day (shared between contexts)
     if Path(args.events).exists():
-        ev = pd.read_parquet(args.events).rename(columns={"day":"period"})
-        X = X.merge(ev, on=["period","label"], how="left").rename(columns={"items":"items_per_day"})
+        ev = pd.read_parquet(args.events).rename(columns={"day":"period"}).copy()
+        ev["label_key"] = ev["label"].astype(str).map(nkey)
+
+        # primary: join on (period, label_key)
+        X = X.merge(
+            ev[["period","label_key","items"]],
+            on=["period","label_key"], how="left"
+        )
+
+        # fallback: if items still null, try legacy (period, label) join for older files
+        miss = X["items"].isna()
+        if miss.any():
+            X.loc[miss, "items"] = X.loc[miss].merge(
+                ev[["period","label","items"]],
+                on=["period","label"], how="left"
+            )["items"].values
+
+        X = X.rename(columns={"items":"items_per_day"})
     else:
         X["items_per_day"] = 0
+
 
     # party lean debug (if present) - shared between contexts
     cls_path = Path("data/topics/political_classification.parquet")
