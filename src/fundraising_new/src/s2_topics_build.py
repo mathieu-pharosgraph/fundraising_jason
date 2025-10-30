@@ -16,6 +16,9 @@ from pathlib import Path
 from functools import partial
 from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
+import sys
+sys.path.append(str(Path(__file__).resolve().parents[3] / "src"))
+from fundraising_new.src.utils.keys import nkey
 
 # Load DeepSeek key from repo's src/secret.env
 ENV_PATH = Path(__file__).resolve().parents[2] / "secret.env"   # .../src/secret.env
@@ -170,9 +173,6 @@ def embed_texts(texts: List[str], backend="sentence-transformers",
         emb = model.encode(texts, batch_size=batch, show_progress_bar=True, normalize_embeddings=True)
         return emb.astype(np.float32)
 
-def _nkey(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+","", str(s).lower())
-
 def _hash_list(xs) -> str:
     b = json.dumps(sorted(list(xs)), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(b).hexdigest()[:16]
@@ -257,7 +257,7 @@ def build_daily_snapshot(day: str,
             "cluster_id": int(rid),
             "label": str(g.get("label", "").iloc[0]) if "label" in g.columns else "",
             "standardized_topic_names": str(g.get("standardized_topic_names", "").iloc[0]),
-            "us_relevance": bool(g["us_relevance"].max()),
+            "us_relevance": bool(g.get("fundraising_us_relevance", False).max()),
             "fundraising_usable": bool(g["fundraising_usable"].max()),
             "fundraising_score": float(pd.to_numeric(g["fundraising_score"], errors="coerce").max()),
             "party_lean": str(g.get("party_lean", "").iloc[0]),
@@ -687,6 +687,8 @@ def main():
         ["fundraising_usable","fundraising_score","n_items"],
         ascending=[False,False,False]
     )
+    meta["label"] = meta.get("fundraising_label", meta.get("voting_label", "")).astype(str)
+
 
     need = {"cluster_id","fundraising_us_relevance","fundraising_usable","fundraising_score",
             "fundraising_label","fundraising_party_lean","fundraising_rationale",
@@ -712,6 +714,7 @@ def main():
         .assign(day=pd.to_datetime(df_rel["published_at"]).dt.date)
         .groupby(["day","label"], as_index=False)
         .agg(items=("item_id","count")))
+    topic_events["label_key"] = topic_events["label"].astype(str).map(nkey)
     topic_events.to_parquet(outdir / "topic_events.parquet", index=False)
 
     # Optional standardized topics from s5 (to carry into snapshots)
@@ -777,18 +780,7 @@ def main():
                     if meta_act.empty:
                         print(f"[snapshot{suffix}] no clusters active on {snap_date}")
                         return
-
-                    # Update this line to include voting metrics in the snapshot:
-                    # active clusters that day
-                    act = (it.merge(clusters_df, on="item_id", how="inner")
-                            [["cluster_id","item_id","cluster_prob"]]
-                            .drop_duplicates("item_id"))
-
-                    meta_act = meta_set.merge(act[["cluster_id"]].drop_duplicates(), on="cluster_id", how="inner")
-                    if meta_act.empty:
-                        print(f"[snapshot{suffix}] no clusters active on {snap_date}")
-                        return
-
+                    
                     # representatives (titles of the day)
                     rep = (it.merge(clusters_df, on="item_id", how="inner")
                             .merge(meta_act[["cluster_id"]], on="cluster_id", how="inner")
@@ -811,7 +803,8 @@ def main():
                             "fundraising_score","voting_score","rep_titles_day","rationale"]])
 
                     # label_key + topics (if available)
-                    snap["label_key"] = snap["label"].astype(str).str.lower().str.replace(r"[^a-z0-9]+","", regex=True)
+                    snap["label_key"] = snap["label"].astype(str).map(nkey)
+
                     if not std_topics.empty:
                         snap = snap.merge(std_topics, on="cluster_id", how="left")
 
