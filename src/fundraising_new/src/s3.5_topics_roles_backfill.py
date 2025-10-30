@@ -7,6 +7,26 @@ import pandas as pd
 import requests as rq
 from dotenv import load_dotenv
 
+# ---------- robust session with retries ----------
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_DS_SESSION = None
+def _ds_session():
+    global _DS_SESSION
+    if _DS_SESSION is None:
+        s = rq.Session()
+        retry = Retry(
+            total=5, connect=5, read=5,
+            backoff_factor=0.8,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["POST"])
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://",  HTTPAdapter(max_retries=retry))
+        _DS_SESSION = s
+    return _DS_SESSION
+
 # ---------- env loader (robust for your repo layout) ----------
 def ensure_env():
     here = Path(__file__).resolve()
@@ -22,7 +42,7 @@ def ensure_env():
 
 # ---------- llm ----------
 def deepseek_chat(messages: List[Dict[str,str]], model: str = None,
-                  max_tokens=400, temperature=0.1, timeout=60) -> str:
+                  max_tokens=400, temperature=0.1, timeout=150) -> str:
     base = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1").rstrip("/")
     url  = f"{base}/chat/completions"
     key  = os.getenv("DEEPSEEK_API_KEY")
@@ -30,11 +50,22 @@ def deepseek_chat(messages: List[Dict[str,str]], model: str = None,
         raise SystemExit("Set DEEPSEEK_API_KEY in env")
     if model is None:
         model = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
+
     hdr = {"Authorization": f"Bearer {key}", "Content-Type":"application/json"}
     pl  = {"model": model, "messages": messages,
            "max_tokens": max_tokens, "temperature": temperature}
-    r = rq.post(url, headers=hdr, json=pl, timeout=timeout); r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+
+    s = _ds_session()
+    try:
+        # tuple timeout: (connect, read)
+        r = s.post(url, headers=hdr, json=pl, timeout=(10, timeout))
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except (rq.exceptions.ReadTimeout, rq.exceptions.ConnectTimeout) as e:
+        raise TimeoutError(f"deepseek timeout: {e}") from e
+    except rq.exceptions.RequestException as e:
+        raise RuntimeError(f"deepseek request error: {e}") from e
+
 
 # ---------- Dual Prompts for Fundraising vs Voting ----------
 FUNDRAISING_ROLES_PROMPT = """Extract role lists from these US political news/reddit snippets for FUNDRAISING context.
@@ -189,8 +220,19 @@ def main():
                 total_updates += 1
             except Exception as e:
                 print(f"Error processing {column_name} for cluster {cid}, period {per}: {e}")
+                # log to file
+                Path("data/topics/metrics").mkdir(parents=True, exist_ok=True)
+                with open("data/topics/metrics/roles_backfill_failures.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "column": column_name,      # "fundraising_roles" or "voting_roles"
+                        "cluster_id": cid,
+                        "period": per,
+                        "error": f"{type(e).__name__}: {e}"
+                    }, ensure_ascii=False) + "\n")
                 # Set empty roles on error
                 df.at[idx, column_name] = {"heroes":[], "villains":[], "victims":[], "antiheroes":[]}
+
             
             time.sleep(0.2)  # Rate limiting
 
