@@ -41,6 +41,11 @@ df = pd.read_parquet(CCES)
 # Merge continuous covars
 state_inc = pd.read_parquet("outputs/mrp/state_income_acs.parquet")[["state_postal","state_income_z"]]
 state_urb = pd.read_parquet("outputs/mrp/state_urban_index_acs.parquet")[["state_postal","state_urban_z"]]
+# --- State two-party GOP share (z-scored) ---
+state_gop = pd.read_parquet("outputs/mrp/state_gop_2p.parquet")[["state_postal","state_gop_2p_z"]]
+df = df.merge(state_gop, on="state_postal", how="left")
+df["state_gop_2p_z"] = df["state_gop_2p_z"].fillna(0.0)  # conservative fallback
+
 df = df.merge(state_inc, on="state_postal", how="left").merge(state_urb, on="state_postal", how="left")
 df["state_income_z"] = df["state_income_z"].fillna(0.0)
 df["state_urban_z"] = df["state_urban_z"].fillna(0.0)
@@ -258,8 +263,10 @@ FORM_COMMON = (
 # Main effects only (drop interactions for first pass)
 FORM_COMMON_MAIN = (
     "  age_bin + sex + race_eth + edu_bin + income_bin + married + owner"
-    " + state_income_z + state_urban_z"
+    " + state_income_z + state_urban_z + state_gop_2p_z"
 )
+
+RE_STATE = " + (1 | state_postal)"
 
 # Random effects: intercept by state only (no varying slopes on first pass)
 RE_SIMPLE = " + (1 | state_postal)"
@@ -326,7 +333,7 @@ if len(df_reg) > 0:
 
 # --- PID7 (ordered) ---
 if len(df_pid) > 0:
-    form_pid  = "pid7 ~ "      + FORM_COMMON_MAIN
+    form_pid = "pid7 ~ " + FORM_COMMON_MAIN + RE_STATE
     priors_pid = {
         "threshold": prior_thresh,
         "age_bin":   prior_coef,
@@ -338,12 +345,10 @@ if len(df_pid) > 0:
         "owner":     prior_coef,
         "state_income_z": prior_coef,
         "state_urban_z":  prior_coef,
+        "state_gop_2p_z": bmb.Prior("Normal", mu=0, sigma=0.5),
+        "1|state_postal_sigma": bmb.Prior("HalfNormal", sigma=0.5),  # RE sd prior
     }
-    m3 = bmb.Model(
-        form_pid, df_pid,
-        family="cumulative", link="probit",
-        priors=priors_pid
-    )
+    m3 = bmb.Model(form_pid, df_pid, family="cumulative", priors=priors_pid)
     m3.build()
     k_pid = len(df_pid["pid7"].cat.categories)
     with m3.backend.model:
