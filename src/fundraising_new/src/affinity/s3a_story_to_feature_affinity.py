@@ -6,15 +6,47 @@ from pathlib import Path
 # You already have deepseek_chat elsewhere; reuse if you want.
 import requests as rq
 
-def deepseek_chat(messages, model="deepseek-chat", max_tokens=600, temperature=0.1, timeout=60):
+import sys
+from pathlib import Path as _P
+# add <repo_root>/src so "fundraising_new" is importable
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+from fundraising_new.src.utils.keys import nkey
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_DS = None
+def _session():
+    global _DS
+    if _DS is None:
+        s = rq.Session()
+        retry = Retry(
+            total=5, connect=5, read=5,
+            backoff_factor=0.8,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["POST"])
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://",  HTTPAdapter(max_retries=retry))
+        _DS = s
+    return _DS
+
+def deepseek_chat(messages, model="deepseek-chat", max_tokens=600, temperature=0.1, timeout=150):
     key  = os.getenv("DEEPSEEK_API_KEY")
     base = os.getenv("DEEPSEEK_API_URL","https://api.deepseek.com/v1").rstrip("/")
     url  = f"{base}/chat/completions"
     if not key: raise SystemExit("Set DEEPSEEK_API_KEY")
     hdr = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     pl  = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
-    r = rq.post(url, headers=hdr, json=pl, timeout=timeout); r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    try:
+        r = _session().post(url, headers=hdr, json=pl, timeout=(10, timeout))
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except (rq.exceptions.ReadTimeout, rq.exceptions.ConnectTimeout) as e:
+        raise TimeoutError(f"deepseek timeout: {e}") from e
+    except rq.exceptions.RequestException as e:
+        raise RuntimeError(f"deepseek request error: {e}") from e
+
 
 PROMPT = """You will score how a political STORY activates a compact set of donor-predictive FEATURES.
 Return STRICT JSON ONLY like:
@@ -30,6 +62,24 @@ STORY (period={period}, label={label}):
 {snippet}
 """
 
+def parse_weights(raw: str) -> dict:
+    s = (raw or "").strip().strip("`").strip()
+    m = re.search(r"\{.*\}", s, re.S)
+    if m: s = m.group(0)
+    try:
+        js = json.loads(s)
+    except Exception:
+        return {}
+    w = js.get("weights", {}) or {}
+    out = {}
+    for k, v in w.items():
+        try:
+            # numeric, clamp to [-1,1]
+            x = max(-1.0, min(1.0, float(v)))
+            out[str(k)] = x
+        except Exception:
+            continue
+    return out
 
 def main():
     ap = argparse.ArgumentParser()
@@ -111,12 +161,23 @@ def main():
 
 
     items = items[["item_id","title","source","url","published_at","text"]]
+
     df = (items.merge(clusters[["item_id","cluster_id","cluster_prob"]], on="item_id", how="inner")
-               .merge(meta[["cluster_id","label"]], on="cluster_id", how="left"))
-    df["period"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True).dt.date.astype(str)
+            .merge(meta[["cluster_id","label"]], on="cluster_id", how="left"))
+
+    # Standardized keys
+    df["period"]     = pd.to_datetime(df["published_at"], errors="coerce", utc=True).dt.date.astype(str)
+    df["label"]      = df["label"].astype(str)
+    df["label_key"]  = df["label"].map(nkey)
+    df["period_norm"]= df["period"]  # alias for consistency
 
     rows=[]
-    for (period,label), sub in df.groupby(["period","label"]):
+    # Group by normalized key + period (still keep the human label for prompts/output)
+    for (period, label_key), sub in df.groupby(["period","label_key"]):
+        # choose a representative human label for this key (first non-empty)
+        label_sample = sub["label"].dropna().astype(str).str.strip()
+        label_human = label_sample.iloc[0] if not label_sample.empty else label_key
+
         sub = sub.sort_values(["cluster_prob","published_at"], ascending=[False,False]).head(10)
         snippet = ""
         for _, r in sub.iterrows():
@@ -125,29 +186,39 @@ def main():
             x = (r.get("text") or "")[:300]
             u = (r.get("url") or "")
             snippet += f"- {t} — {s}\n  {x}\n  {u}\n"
+
         messages = [
             {"role":"system","content":"You are a careful scoring assistant. JSON only."},
             {"role":"user", "content": PROMPT.format(feature_keys=", ".join(feature_keys),
-                                                     period=period, label=label, snippet=snippet)}
+                                                    period=period, label=label_human, snippet=snippet)}
         ]
         try:
             raw = deepseek_chat(messages, model=args.model, max_tokens=700, temperature=0.1)
-            s = raw.strip().strip("`").strip()
-            j = json.loads(re.search(r"\{.*\}", s, re.S).group(0))
-            w = j.get("weights", {}) or {}
-            # sparsify to max-weights
-            if len(w) > args.max_weights:
-                # keep top by absolute value
-                w = dict(sorted(w.items(), key=lambda kv: abs(float(kv[1]) if kv[1] is not None else 0.0),
-                                reverse=True)[:args.max_weights])
-            for k,v in w.items():
-                try: rows.append({"period":period,"label":label,
-                                  "feature_key":str(k),"weight":float(v)})
-                except: continue
+            weights = parse_weights(raw)
+            # sparsify to max-weights (by |weight|)
+            if len(weights) > args.max_weights:
+                weights = dict(sorted(weights.items(),
+                                    key=lambda kv: abs(kv[1]),
+                                    reverse=True)[:args.max_weights])
+            for k,v in weights.items():
+                rows.append({"period": period,
+                            "label": label_human,
+                            "label_key": label_key,
+                            "feature_key": str(k),
+                            "weight": float(v)})
         except Exception as e:
-            # skip on failure
+            # log once; skip on failure
+            Path("data/topics/metrics").mkdir(parents=True, exist_ok=True)
+            with open("data/topics/metrics/story_affinity_failures.jsonl","a",encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "period": period,
+                    "label_key": label_key,
+                    "error": f"{type(e).__name__}: {e}"
+                }, ensure_ascii=False) + "\n")
             continue
         time.sleep(0.15)
+
 
     out = pd.DataFrame(rows)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
