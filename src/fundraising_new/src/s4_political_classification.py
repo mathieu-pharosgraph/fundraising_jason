@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential
 import pyarrow.dataset as ds
+import sys
+from pathlib import Path as _P
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
 
+from fundraising_new.src.utils.keys import nkey
 # Load environment variables
 from dotenv import load_dotenv
 ENV_PATH = Path(__file__).resolve().parents[2] / "secret.env"
@@ -95,27 +99,52 @@ Cluster items:
 
 def nkey(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
 
+# ---- robust session with retries for DeepSeek ----
+import requests as rq
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_DS_SESSION = None
+def _ds_session():
+    global _DS_SESSION
+    if _DS_SESSION is None:
+        s = rq.Session()
+        retry = Retry(
+            total=5, connect=5, read=5,
+            backoff_factor=0.8,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["POST"])
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://",  HTTPAdapter(max_retries=retry))
+        _DS_SESSION = s
+    return _DS_SESSION
+
 def deepseek_chat(messages: List[Dict[str, str]], model="deepseek-chat",
-                  max_tokens=300, temperature=0.1):
-    """Direct implementation of deepseek_chat function"""
+                  max_tokens=300, temperature=0.1, timeout=150):
+    """DeepSeek chat with retries + longer read timeout."""
     base = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
-    url = f"{base.rstrip('/')}/chat/completions"
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    url  = f"{base.rstrip('/')}/chat/completions"
+    key  = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         raise SystemExit("Set DEEPSEEK_API_KEY in env")
-    
+
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model, 
-        "messages": messages,
-        "max_tokens": max_tokens, 
-        "temperature": temperature
-    }
-    
-    response = requests.post(url, headers=headers, json=payload, timeout=(10, 30))
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"]
+    payload = {"model": model, "messages": messages,
+               "max_tokens": max_tokens, "temperature": temperature}
+
+    s = _ds_session()
+    try:
+        # tuple timeout: (connect, read)
+        r = s.post(url, headers=headers, json=payload, timeout=(10, timeout))
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+    except (rq.exceptions.ReadTimeout, rq.exceptions.ConnectTimeout) as e:
+        raise TimeoutError(f"deepseek timeout: {e}") from e
+    except rq.exceptions.RequestException as e:
+        raise RuntimeError(f"deepseek request error: {e}") from e
+
 
 def get_current_date_context():
     """Get the current date and format it for context priming"""
@@ -571,13 +600,8 @@ def main():
             results_df[c] = pd.to_numeric(results_df.get(c, np.nan), errors="coerce").clip(0,100)
 
         # Create label_key for stable merges
-        results_df["label_key"] = (
-            results_df["story_label"]
-            .astype(str)
-            .str.lower()
-            .str.replace(r"[^a-z0-9]+", "", regex=True)
-            .str.strip()
-        )
+        results_df["label_key"] = results_df["story_label"].astype(str).map(nkey)
+
         results_df["period"] = results_df["period"].astype(str)
         results_df["cluster_id"] = pd.to_numeric(results_df["cluster_id"], errors="coerce").astype("Int64")
         
