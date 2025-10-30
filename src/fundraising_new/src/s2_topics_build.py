@@ -35,6 +35,28 @@ import trafilatura
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- resilient HTTP session for DeepSeek
+import requests as rq
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_DS_SESSION = None
+def _ds_session():
+    global _DS_SESSION
+    if _DS_SESSION is None:
+        s = rq.Session()
+        retry = Retry(
+            total=5,                 # total retries
+            connect=5, read=5,      # per phase
+            backoff_factor=0.8,     # 0.8, 1.6, 3.2, ...
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["POST"])
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://",  HTTPAdapter(max_retries=retry))
+        _DS_SESSION = s
+    return _DS_SESSION
+
 # ---------- embeddings ----------
 EMB_BACKENDS = ("openai", "sentence-transformers")
 try:
@@ -306,19 +328,29 @@ def cluster_representatives(df: pd.DataFrame, X: np.ndarray, labels: np.ndarray,
 
 # ---------- LLM verify/label (DeepSeek) ----------
 def deepseek_chat(messages: List[Dict[str, str]], model="deepseek-chat",
-                  max_tokens=300, temperature=0.1):
+                  max_tokens=300, temperature=0.1, timeout=120):
     base = os.environ.get("DEEPSEEK_API_URL", "https://api.deepseek.com/v1")
-    url = f"{base.rstrip('/')}/chat/completions"   # <-- ensure correct endpoint
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    url  = f"{base.rstrip('/')}/chat/completions"
+    key  = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         raise SystemExit("Set DEEPSEEK_API_KEY in env")
     hdr = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages,
                "max_tokens": max_tokens, "temperature": temperature}
-    r = rq.post(url, headers=hdr, json=payload, timeout=60)
-    r.raise_for_status()
-    j = r.json()
-    return j["choices"][0]["message"]["content"]
+    s = _ds_session()
+    try:
+        # tuple timeout: (connect_timeout, read_timeout)
+        r = s.post(url, headers=hdr, json=payload, timeout=(10, timeout))
+        r.raise_for_status()
+        j = r.json()
+        return j["choices"][0]["message"]["content"]
+    except (rq.exceptions.ReadTimeout, rq.exceptions.ConnectTimeout) as e:
+        # surface a clear, typed error so callers can fallback
+        raise TimeoutError(f"deepseek timeout: {e}") from e
+    except rq.exceptions.RequestException as e:
+        # other transient HTTP issues
+        raise RuntimeError(f"deepseek request error: {e}") from e
+
 
 
 VERIFY_PROMPT = """You are vetting a TOPIC CLUSTER for a US political fundraising dashboard.
@@ -392,7 +424,18 @@ def llm_verify_label_voting(snippets: List[str]) -> Dict[str, Any]:
         {"role":"user","content": VOTING_PROMPT.replace("{snips}", snips)}
     ]
     
-    txt = deepseek_chat(msg)
+    try:
+        txt = deepseek_chat(msg, timeout=150)  # longer read timeout
+    except Exception as e:
+        Path("data/topics/metrics").mkdir(parents=True, exist_ok=True)
+        with open("data/topics/metrics/llm_label_voting_failures.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "error": f"{type(e).__name__}: {e}",
+                "kind": "voting"
+            }, ensure_ascii=False) + "\n")
+        return _default_voting()
+
     
     # Use the same robust JSON parsing as before
     try:
@@ -514,6 +557,26 @@ def safe_json_load(raw: str, schema: dict | None = None) -> dict:
             continue
     raise ValueError(f"Could not parse JSON after repairs: {last_err}")
 
+# ---- default fallbacks if the LLM call times out or errors ----
+def _default_fundraising():
+    return {
+        "us_relevance": False,
+        "fundraising_usable": False,
+        "fundraising_score": 0,
+        "party_lean": "Neutral",
+        "label": "Unknown",
+        "rationale": ""
+    }
+
+def _default_voting():
+    return {
+        "us_relevance": False,
+        "voting_usable": False,
+        "voting_score": 0,
+        "party_lean": "Neutral",
+        "label": "Unknown",
+        "rationale": ""
+    }
 
 def llm_verify_label(snippets: List[str]) -> Dict[str, Any]:
     """
@@ -533,7 +596,18 @@ def llm_verify_label(snippets: List[str]) -> Dict[str, Any]:
 
     ]
 
-    txt = deepseek_chat(msg)
+    try:
+        txt = deepseek_chat(msg, timeout=150)  # longer read timeout
+    except Exception as e:
+        Path("data/topics/metrics").mkdir(parents=True, exist_ok=True)
+        with open("data/topics/metrics/llm_label_failures.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "error": f"{type(e).__name__}: {e}",
+                "kind": "fundraising"
+            }, ensure_ascii=False) + "\n")
+        return _default_fundraising()
+
 
     # Try robust parse
     try:
