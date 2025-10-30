@@ -215,6 +215,29 @@ def load_topic_data(topics_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
     clusters = pd.read_parquet(topics_dir / "clusters.parquet")
     meta     = pd.read_parquet(topics_dir / "cluster_meta.parquet")
 
+    # Synthesize generic label/party_lean from fundraising→voting fallbacks
+    f_lbl = meta.get("fundraising_label")
+    v_lbl = meta.get("voting_label")
+    if f_lbl is not None or v_lbl is not None:
+        meta["label"] = (
+            (f_lbl.astype(str) if f_lbl is not None else "")
+            .where((f_lbl.notna() if f_lbl is not None else False) &
+                (f_lbl.astype(str).str.strip() != ""), v_lbl)
+            .fillna("")
+            .astype(str)
+        )
+
+    f_pl = meta.get("fundraising_party_lean")
+    v_pl = meta.get("voting_party_lean")
+    if f_pl is not None or v_pl is not None:
+        meta["party_lean"] = (
+            (f_pl.astype(str) if f_pl is not None else "")
+            .where((f_pl.notna() if f_pl is not None else False) &
+                (f_pl.astype(str).str.strip() != ""), v_pl)
+            .fillna("")
+            .astype(str)
+        )
+
     # Optionally enrich meta with standardized topics (if present)
     std_path = topics_dir / "merged_data_with_topics.parquet"
     if std_path.exists():
