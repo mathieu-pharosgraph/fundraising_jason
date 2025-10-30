@@ -56,6 +56,21 @@ def main():
 
     sp["period_norm"] = pd.to_datetime(sp[per_col], errors="coerce").dt.date.astype("string")
     
+    # --- NEW: if spiders has base (unprefixed) columns, mirror them into both contexts ---
+    base_num = [c for c in sp.columns if c.startswith(("emo_", "mf_", "cta_ask_strength"))]
+    base_txt = [c for c in sp.columns if c in {"cta_ask_type","cta_copy","heroes","villains","victims","antiheroes"}]
+
+    # Only create prefixed copies if they don't already exist
+    for c in base_num:
+        f, v = f"fundraising_{c}", f"voting_{c}"
+        if f not in sp.columns: sp[f] = sp[c]
+        if v not in sp.columns: sp[v] = sp[c]
+
+    for c in base_txt:
+        f, v = f"fundraising_{c}", f"voting_{c}"
+        if f not in sp.columns: sp[f] = sp[c]
+        if v not in sp.columns: sp[v] = sp[c]
+
     # Define target columns for BOTH fundraising and voting
     # Numeric columns (emotions, moral foundations, CTA strength)
     base_num_prefixes = ["emo_", "mf_", "cta_ask_strength"]
@@ -142,8 +157,15 @@ def main():
     voting_count = len([c for c in targets_num + targets_txt if c.startswith("voting_") and c in out.columns])
     
     print(f"[merge_spiders_into_enriched] Final context coverage:")
-    print(f"  Fundraising: {fundraising_coverage/fundraising_count:.1f}% average across {fundraising_count} columns")
-    print(f"  Voting:      {voting_coverage/voting_count:.1f}% average across {voting_count} columns")
+    if fundraising_count:
+        print(f"  Fundraising: {fundraising_coverage/fundraising_count:.1f}% average across {fundraising_count} columns")
+    else:
+        print(f"  Fundraising: n/a (0 columns)")
+    if voting_count:
+        print(f"  Voting:      {voting_coverage/voting_count:.1f}% average across {voting_count} columns")
+    else:
+        print(f"  Voting:      n/a (0 columns)")
+
 
 if __name__ == "__main__":
     main()
