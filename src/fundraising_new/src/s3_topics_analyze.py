@@ -426,19 +426,15 @@ def save_metrics(out_dir: Path, rows: List[Dict[str, Any]]):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
-    """Flatten emotions/moral/cta/roles from topic_metrics.parquet to per-(period,label_key) CSV."""
+    """
+    Flatten BOTH contexts (fundraising_*, voting_*) from topic_metrics.parquet
+    to one row per (period_norm, label_key, cluster_id), with stable keys
+    and context-prefixed columns ready to merge.
+    """
     import json, ast, re
     import pandas as pd
 
-    def _nkey(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
-
-    if not metrics_parquet.exists():
-        print(f"[spiders] metrics parquet missing: {metrics_parquet}"); return
-
-    df = pd.read_parquet(metrics_parquet)  # expected: label, period, emotions, moral_foundations, cta, roles
-    df["period_norm"] = pd.to_datetime(df.get("period",""), errors="coerce").dt.date.astype("string")
-    df["label_key"]   = df.get("label","").astype(str).apply(_nkey)
-
+    def nkey(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
     def _to_obj(x):
         if isinstance(x, dict): return x
         s = str(x or "").strip()
@@ -449,31 +445,105 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
             except Exception: pass
         return {}
 
-    emo   = pd.json_normalize(df["emotions"].map(_to_obj)).add_prefix("emo_")
-    mf    = pd.json_normalize(df["moral_foundations"].map(_to_obj)).add_prefix("mf_")
-    cta   = pd.json_normalize(df["cta"].map(_to_obj).map(_normalize_cta)).add_prefix("cta_")
-    roles = pd.json_normalize(df["roles"].map(_to_obj))[["heroes","villains","victims","antiheroes"]]
+    if not Path(metrics_parquet).exists():
+        print(f"[spiders] metrics parquet missing: {metrics_parquet}"); return
 
-    tall = pd.concat([df[["period_norm","label_key"]], emo, mf, cta, roles], axis=1)
+    # --- load metrics (expects BOTH fundraising_* and voting_* json columns)
+    df = pd.read_parquet(metrics_parquet)
 
-    num_cols = [c for c in tall.columns if c.startswith(("emo_","mf_","cta_ask_strength"))]
+    # keys
+    df["period_norm"] = pd.to_datetime(df.get("period",""), errors="coerce").dt.date.astype("string")
+    df["label"]       = df.get("label", df.get("story_label","")).astype(str)
+    df["label_key"]   = df["label"].map(nkey)
 
-    def _first_nonempty(series):
-        s = series.dropna().astype(str).str.strip()
-        s = s[(s != "") & (s.str.lower() != "nan")]
-        return s.iloc[0] if not s.empty else None
+    # --- fundraising context flatten
+    f_emo = pd.json_normalize(df["fundraising_emotions"].map(_to_obj)).add_prefix("fundraising_emo_")
+    f_mf  = pd.json_normalize(df["fundraising_moral_foundations"].map(_to_obj)).add_prefix("fundraising_mf_")
+    # CTA
+    def _normalize_cta(obj):
+        if not isinstance(obj, dict): return {}
+        k = {str(k).lower().replace("-","_").replace(" ","_"): v for k, v in obj.items()}
+        out = {}
+        if "ask_type"     in k: out["fundraising_cta_ask_type"] = k["ask_type"]
+        if "ask_strength" in k: out["fundraising_cta_ask_strength"] = k["ask_strength"]
+        if "copy"         in k: out["fundraising_cta_copy"] = k["copy"]
+        return out
+    f_cta = pd.json_normalize(df["fundraising_cta"].map(_normalize_cta))
 
+    # roles
+    def _roles(obj):
+        if isinstance(obj,str):
+            try: obj=json.loads(obj)
+            except Exception: obj={}
+        if not isinstance(obj,dict): obj={}
+        def _lst(x):
+            if isinstance(x,list): return x
+            if isinstance(x,str) and x.strip(): return [x.strip()]
+            return []
+        return {
+            "fundraising_heroes":    _lst(obj.get("heroes",[])),
+            "fundraising_villains":  _lst(obj.get("villains",[])),
+            "fundraising_victims":   _lst(obj.get("victims",[])),
+            "fundraising_antiheroes":_lst(obj.get("antiheroes",[])),
+        }
+    f_roles = pd.json_normalize(df["fundraising_roles"].map(_roles))
 
-    agg = (tall.groupby(["period_norm","label_key"], as_index=False)
-            .agg({**{c:"mean" for c in num_cols},
-                    **{c:_first_nonempty for c in ["cta_ask_type","cta_copy","heroes","villains","victims","antiheroes"]
-                    if c in tall.columns}}))
+    # --- voting context flatten
+    v_emo = pd.json_normalize(df["voting_emotions"].map(_to_obj)).add_prefix("voting_emo_")
+    v_mf  = pd.json_normalize(df["voting_moral_foundations"].map(_to_obj)).add_prefix("voting_mf_")
+    def _normalize_vcta(obj):
+        if not isinstance(obj, dict): return {}
+        k = {str(k).lower().replace("-","_").replace(" ","_"): v for k, v in obj.items()}
+        out = {}
+        if "ask_type"     in k: out["voting_cta_ask_type"] = k["ask_type"]
+        if "ask_strength" in k: out["voting_cta_ask_strength"] = k["ask_strength"]
+        if "copy"         in k: out["voting_cta_copy"] = k["copy"]
+        return out
+    v_cta = pd.json_normalize(df["voting_cta"].map(_normalize_vcta))
 
+    def _vroles(obj):
+        if isinstance(obj,str):
+            try: obj=json.loads(obj)
+            except Exception: obj={}
+        if not isinstance(obj,dict): obj={}
+        def _lst(x):
+            if isinstance(x,list): return x
+            if isinstance(x,str) and x.strip(): return [x.strip()]
+            return []
+        return {
+            "voting_heroes":    _lst(obj.get("heroes",[])),
+            "voting_villains":  _lst(obj.get("villains",[])),
+            "voting_victims":   _lst(obj.get("victims",[])),
+            "voting_antiheroes":_lst(obj.get("antiheroes",[])),
+        }
+    v_roles = pd.json_normalize(df["voting_roles"].map(_vroles))
 
+    # assemble
+    spiders = pd.concat([
+        df[["period_norm","label_key"]],
+        f_emo, f_mf, f_cta, f_roles,
+        v_emo, v_mf, v_cta, v_roles
+    ], axis=1)
 
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    agg.to_csv(out_csv, index=False)
-    print(f"[spiders] wrote {out_csv} rows={len(agg)}")
+    # --- join S5 to add cluster_id
+    s5 = pd.read_parquet("data/topics/merged_data_with_topics.parquet")
+    s5["period_norm"] = pd.to_datetime(s5.get("period",""), errors="coerce").dt.date.astype("string")
+    s5["label_key"]   = s5.get("label", s5.get("story_label","")).astype(str).map(nkey)
+    m5 = (s5[["period_norm","label_key","cluster_id"]]
+          .dropna(subset=["cluster_id"])
+          .drop_duplicates(["period_norm","label_key"]))
+    spiders = spiders.merge(m5, on=["period_norm","label_key"], how="left")
+
+    # final clean
+    num_like = [c for c in spiders.columns if c.endswith("_cta_ask_strength") or
+                c.startswith("fundraising_emo_") or c.startswith("fundraising_mf_") or
+                c.startswith("voting_emo_") or c.startswith("voting_mf_")]
+    for c in num_like:
+        spiders[c] = pd.to_numeric(spiders[c], errors="coerce")
+
+    spiders.to_csv(out_csv, index=False)
+    print(f"[spiders] wrote {out_csv} rows={len(spiders)} with cluster_id non-null={spiders['cluster_id'].notna().sum()}")
+
 
 # ---------- main ----------
 def main():
