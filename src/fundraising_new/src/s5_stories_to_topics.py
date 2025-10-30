@@ -5,6 +5,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+from pathlib import Path as _P
+# add <repo_root>/src so "fundraising_new" is importable
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+from fundraising_new.src.utils.keys import nkey
 
 # 1. Load data using the same approach as your Streamlit app
 def load_and_merge_data():
@@ -86,6 +91,11 @@ def load_and_merge_data():
 
 # Load the merged data
 merged_df = load_and_merge_data()
+# Stable keys for joins and caching
+merged_df["period"]     = merged_df.get("period", "").astype(str)
+merged_df["label_key"]  = merged_df.get("label", "").astype(str).map(nkey)
+merged_df["period_norm"] = pd.to_datetime(merged_df["period"], errors="coerce").dt.date.astype("string")
+
 print(f"Merged DataFrame has {len(merged_df)} rows")
 print(f"Available columns in merged data: {list(merged_df.columns)}")
 
@@ -94,7 +104,8 @@ voting_columns = [col for col in merged_df.columns if 'voting' in col.lower()]
 print(f"Voting columns found: {voting_columns}")
 
 # Get the unique labels from the merged data
-cluster_labels = merged_df['label'].unique().tolist()
+cluster_labels = merged_df["label"].astype(str).unique().tolist()  # keep text list for LLM
+label_keys     = merged_df["label_key"].astype(str).unique().tolist()
 print(f"Found {len(cluster_labels)} unique labels to classify")
 
 cache_file_path = "data/topics/classification_cache.json"
@@ -120,8 +131,17 @@ def get_hash(input_string):
     return hashlib.sha256(input_string.strip().encode('utf-8')).hexdigest()
 
 # 2. Configure the DeepSeek API Classifier
-API_KEY = "sk-2893e99d295945b292efbc7dcba825d5"
-API_URL = "https://api.deepseek.com/v1/chat/completions"  # Verify the correct endpoint
+# --- DeepSeek creds from env (secret.env)
+from dotenv import load_dotenv
+here = Path(__file__).resolve()
+for p in [here.parents[2] / "src" / "secret.env", here.parents[2] / "secret.env"]:
+    if p.exists():
+        load_dotenv(p)
+        break
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")           # required
+DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1").rstrip("/")
+DEEPSEEK_CHAT_MODEL = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
+API_URL = f"{DEEPSEEK_API_URL}/chat/completions"
 
 # Our expertly crafted system prompt
 SYSTEM_PROMPT = """
@@ -177,6 +197,26 @@ INSTRUCTIONS:
 - Output ONLY a comma-separated list of the exact topic numbers (e.g., "3, 30"). Do not include any other text, explanation, or formatting in your response.
 """
 
+import requests as rq
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_DS = None
+def _session():
+    global _DS
+    if _DS is None:
+        s = rq.Session()
+        retry = Retry(
+            total=5, connect=5, read=5,
+            backoff_factor=0.8,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["POST"])
+        )
+        s.mount("https://", HTTPAdapter(max_retries=retry))
+        s.mount("http://",  HTTPAdapter(max_retries=retry))
+        _DS = s
+    return _DS
+
 def classify_with_deepseek(headline, max_retries=3):
     """
     Sends a headline to the DeepSeek API for classification.
@@ -184,53 +224,33 @@ def classify_with_deepseek(headline, max_retries=3):
     """
     for attempt in range(max_retries):
         payload = {
-            "model": "deepseek-chat",
+            "model": DEEPSEEK_CHAT_MODEL,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": headline}
+                {"role": "user",   "content": headline}
             ],
             "temperature": 0.0,
             "max_tokens": 20
         }
-
         headers = {
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
             "Content-Type": "application/json"
         }
-
         try:
-            response = requests.post(API_URL, json=payload, headers=headers)
-            response.raise_for_status()
-            response_data = response.json()
-
-            classification_text = response_data['choices'][0]['message']['content'].strip()
-            
-            # Check if the response is empty
+            r = _session().post(API_URL, json=payload, headers=headers, timeout=(10, 120))
+            r.raise_for_status()
+            classification_text = r.json()["choices"][0]["message"]["content"].strip()
             if not classification_text:
-                print(f"Empty response for headline: {headline}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)  # Wait before retrying
-                    continue
-                return []
-                
-            # Clean the response: remove periods, extra spaces, and split into a list of integers.
-            topic_numbers = [int(num.strip()) for num in classification_text.split(',')]
+                raise ValueError("Empty response")
+            topic_numbers = [int(num.strip()) for num in classification_text.split(",") if num.strip().isdigit()]
             return topic_numbers
+        except (rq.exceptions.RequestException, ValueError, KeyError) as e:
+            print(f"DeepSeek classify failed for '{headline}' (attempt {attempt+1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            return []
 
-        except requests.exceptions.RequestException as e:
-            print(f"API request failed for headline '{headline}' (attempt {attempt+1}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)  # Wait before retrying
-                continue
-            return []
-        except (KeyError, ValueError) as e:
-            print(f"Failed to parse response for headline '{headline}'. Response: '{classification_text}'. Error: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)  # Wait before retrying
-                continue
-            return []
-    
-    return []  # If all retries failed
 
 # 3. Classify the Labels in Batch
 # Load the existing cache
@@ -241,20 +261,16 @@ standardized_topics = []  # This will store the results for ALL labels, cached o
 delay_between_calls = 0.1  # 100 ms delay
 
 for label in cluster_labels:
-    label_hash = get_hash(label)
-    
-    # Check if we have a cached result for this hash
-    if label_hash in classification_cache:
-        # Use the cached result
-        topic_list = classification_cache[label_hash]
+    label_norm = nkey(label)
+    cache_key  = label_norm or get_hash(label)  # normalized preferred, fallback to hash
+    if cache_key in classification_cache:
+        topic_list = classification_cache[cache_key]
         print(f"Cache hit for: {label}")
     else:
-        # This is a new label, call the API
         topic_list = classify_with_deepseek(label)
-        # Cache the result for future runs
-        classification_cache[label_hash] = topic_list
+        classification_cache[cache_key] = topic_list
         print(f"Classified and cached: {label} -> {topic_list}")
-        time.sleep(delay_between_calls)  # Wait before making the next API call
+        time.sleep(delay_between_calls)
     
     # Append the result (whether from cache or API) to our main list
     standardized_topics.append(topic_list)
@@ -264,8 +280,18 @@ for label in cluster_labels:
 save_cache(classification_cache)
 
 # 4. Create a mapping from label to topic IDs and apply it to the merged DataFrame
-label_to_topics = dict(zip(cluster_labels, standardized_topics))
-merged_df['standardized_topic_ids'] = merged_df['label'].map(label_to_topics)
+# align lengths; if duplicates exist in labels, align via label_key
+if len(cluster_labels) != len(standardized_topics):
+    # fall back: rebuild via dataframe to ensure alignment on label_key
+    tmp = (pd.DataFrame({"label": cluster_labels, "std_ids": standardized_topics})
+             .assign(label_key=lambda d: d["label"].astype(str).map(nkey))
+             .drop_duplicates("label_key"))
+    label_to_topics = dict(zip(tmp["label_key"], tmp["std_ids"]))
+else:
+    label_to_topics = dict(zip([nkey(x) for x in cluster_labels], standardized_topics))
+
+merged_df["standardized_topic_ids"] = merged_df["label_key"].map(label_to_topics)
+
 
 # Map the topic IDs to topic names
 topic_id_to_name = {
@@ -316,6 +342,11 @@ merged_df['standardized_topic_names'] = merged_df['standardized_topic_ids'].appl
 
 # Save the enriched DataFrame back to a new Parquet file
 output_path = "data/topics/merged_data_with_topics.parquet"
+# keep keys in the parquet for downstream joins
+cols_for_keys = ["label_key", "period_norm"]
+for c in cols_for_keys:
+    if c not in merged_df.columns:
+        merged_df[c] = ""
 merged_df.to_parquet(output_path, index=False)
 
 print(f"Classification complete! Results saved to: {output_path}")
@@ -329,7 +360,7 @@ try:
     # Define canonical columns for CSV export - NOW INCLUDES VOTING
     canonical = [
         # Core identifiers
-        "period","cluster_id","label","story_label",
+        "period","cluster_id","label","story_label","label_key",
         "standardized_topic_names","standardized_topic_ids",
         
         # Political classification (BOTH fundraising and voting)
