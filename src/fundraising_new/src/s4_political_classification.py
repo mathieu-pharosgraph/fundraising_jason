@@ -375,6 +375,9 @@ def main():
     # Load cache
     cache_path = output_dir / args.cache_file
     cache_df = load_or_create_cache(cache_path)
+    for col, default in [("cluster_id", pd.NA), ("content_hash",""), ("context","")]:
+        if col not in cache_df.columns:
+            cache_df[col] = default
     print(f"Cache contains {len(cache_df)} entries")
     
     # Process each context
