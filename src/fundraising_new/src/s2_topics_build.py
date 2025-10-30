@@ -876,8 +876,17 @@ def main():
                             [["snapshot_date","cluster_id","label","party_lean",
                             "fundraising_score","voting_score","rep_titles_day","rationale"]])
 
-                    # label_key + topics (if available)
-                    snap["label_key"] = snap["label"].astype(str).map(nkey)
+                    snap = snap.loc[:, ~snap.columns.duplicated()].copy()
+
+                    # if label got split into label_x/label_y by an upstream change, normalize back to 'label'
+                    if "label" not in snap.columns:
+                        if "label_x" in snap.columns:
+                            snap = snap.rename(columns={"label_x": "label"})
+                        elif "label_y" in snap.columns:
+                            snap = snap.rename(columns={"label_y": "label"})
+
+                    # now safely compute the standardized key
+                    snap["label_key"] = snap.apply(lambda r: nkey(str(r["label"])), axis=1)
 
                     if not std_topics.empty:
                         snap = snap.merge(std_topics, on="cluster_id", how="left")
