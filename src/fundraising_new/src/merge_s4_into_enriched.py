@@ -82,8 +82,16 @@ def main():
         voting_cols = common_cols + ["dem_voting_potential", "gop_voting_potential"]
         
         # Process fundraising context
-        s4_fundraising = s4_fundraising[["period_norm", "cluster_id", "label_key"] + fundraising_cols]
-        s4_voting = s4_voting[["period_norm", "cluster_id", "label_key"] + voting_cols]
+        # Keep processed_at so we can pick latest rows
+        keep_f = ["period_norm", "cluster_id", "label_key", "processed_at"] + fundraising_cols
+        keep_v = ["period_norm", "cluster_id", "label_key", "processed_at"] + voting_cols
+
+        existing_f = [c for c in keep_f if c in s4_fundraising.columns]
+        existing_v = [c for c in keep_v if c in s4_voting.columns]
+
+        s4_fundraising = s4_fundraising[existing_f].copy()
+        s4_voting      = s4_voting[existing_v].copy()
+
         
     else:
         # OLD FORMAT: Assume direct fundraising/voting columns exist
@@ -102,9 +110,12 @@ def main():
     print(f"[merge_s4_into_enriched] Voting columns to merge: {voting_cols}")
 
     # Keep the latest per (period_norm,cluster_id) and per (period_norm,label_key)
-    if "processed_at" in s4.columns:
+    # Keep the latest per key using processed_at, if present
+    if "processed_at" in s4_fundraising.columns:
         s4_fundraising = s4_fundraising.sort_values("processed_at")
+    if "processed_at" in s4_voting.columns:
         s4_voting = s4_voting.sort_values("processed_at")
+
 
     # Create primary and secondary keys for both contexts
     s4_fundraising_pk = s4_fundraising.drop_duplicates(["period_norm","cluster_id"], keep="last")
