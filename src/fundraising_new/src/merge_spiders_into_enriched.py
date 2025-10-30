@@ -2,9 +2,11 @@
 import argparse, re, ast, json
 import pandas as pd
 from pathlib import Path
-
-def nkey(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+","", str(s).lower())
+import sys
+from pathlib import Path as _P
+# add <repo_root>/src so "fundraising_new" is importable
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+from fundraising_new.src.utils.keys import nkey
 
 def pct(series: pd.Series) -> float:
     s = series
@@ -33,12 +35,17 @@ def main():
     print(f"[merge_spiders_into_enriched] Starting merge for both fundraising and voting...")
 
     # ------- load enriched (BOTH FUNDRAISING + VOTING)
-    en = pd.read_csv(args.enriched)
+    en = pd.read_csv(args.enriched, low_memory=False)
     print(f"[merge_spiders_into_enriched] Loaded enriched: {len(en)} rows, columns: {list(en.columns)}")
-    
+
     en["period_norm"] = pd.to_datetime(en.get("period",""), errors="coerce").dt.date.astype("string")
     lab_en = "story_label" if "story_label" in en.columns else ("label" if "label" in en.columns else None)
     en["label_key"] = en[lab_en].astype(str).apply(nkey) if lab_en else ""
+
+    # make sure cluster_id is nullable int (if present)
+    if "cluster_id" in en.columns:
+        en["cluster_id"] = pd.to_numeric(en["cluster_id"], errors="coerce").astype("Int64")
+
 
     # Clean standardized topics (make sure it's "a; b; c" not [..] or "nan"
     if "standardized_topic_names" in en.columns:
@@ -117,6 +124,33 @@ def main():
     out = en.merge(spm.rename(columns={c:f"{c}__sp" for c in targets_num + targets_txt}),
                    on=["period_norm","label_key"], how="left")
 
+    # ---- secondary fill by (period_norm, cluster_id) if present
+    if "cluster_id" in out.columns and "cluster_id" in sp.columns:
+        keep_cols2 = ["period_norm","cluster_id"] + targets_num + targets_txt
+        spm2 = sp[keep_cols2].drop_duplicates(["period_norm","cluster_id"], keep="last")
+        out = out.merge(spm2.rename(columns={c:f"{c}__sp2" for c in targets_num+targets_txt}),
+                        on=["period_norm","cluster_id"], how="left")
+
+        # numeric fills
+        for c in targets_num:
+            sc = f"{c}__sp2"
+            if sc in out.columns:
+                out[c] = pd.to_numeric(out.get(c), errors="coerce")
+                out[sc]= pd.to_numeric(out[sc], errors="coerce")
+                out[c] = out[c].where(out[c].notna(), out[sc])
+                out.drop(columns=[sc], inplace=True, errors="ignore")
+
+        # text fills (treat [], [ ] as blank too)
+        def blank(s):
+            t = s.astype(str).str.strip().str.lower()
+            return t.isin(["", "nan", "none", "—", "[]", "[ ]"])
+        for c in targets_txt:
+            sc = f"{c}__sp2"
+            if sc in out.columns:
+                m = blank(out.get(c, ""))
+                out.loc[m, c] = out.loc[m, sc]
+                out.drop(columns=[sc], inplace=True, errors="ignore")
+
     # fill numerics first - handle BOTH fundraising and voting
     for c in targets_num:
         spc = f"{c}__sp"
@@ -145,6 +179,8 @@ def main():
     for c in all_targets:
         if c in out.columns:
             print(f"  {c:>35}: {pct(out[c]):6.1f}%")
+
+    out = out.loc[:, ~out.columns.duplicated()].copy()
 
     out.to_csv(args.out, index=False)
     print(f"[merge_spiders_into_enriched] wrote {args.out} rows={len(out)}")
