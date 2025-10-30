@@ -38,7 +38,10 @@ from urllib3.util.retry import Retry
 # ---------- env ----------
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
-
+import sys
+from pathlib import Path as _P
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+from fundraising_new.src.utils.keys import nkey
 
 
 
@@ -434,7 +437,6 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
     import json, ast, re
     import pandas as pd
 
-    def nkey(s): return re.sub(r"[^a-z0-9]+","", str(s).lower())
     def _to_obj(x):
         if isinstance(x, dict): return x
         s = str(x or "").strip()
@@ -454,7 +456,8 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
     # keys
     df["period_norm"] = pd.to_datetime(df.get("period",""), errors="coerce").dt.date.astype("string")
     df["label"]       = df.get("label", df.get("story_label","")).astype(str)
-    df["label_key"]   = df["label"].map(nkey)
+    df["label_key"] = df["label"].astype(str).map(nkey)
+
 
     # --- fundraising context flatten
     f_emo = pd.json_normalize(df["fundraising_emotions"].map(_to_obj)).add_prefix("fundraising_emo_")
@@ -528,7 +531,7 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
     # --- join S5 to add cluster_id
     s5 = pd.read_parquet("data/topics/merged_data_with_topics.parquet")
     s5["period_norm"] = pd.to_datetime(s5.get("period",""), errors="coerce").dt.date.astype("string")
-    s5["label_key"]   = s5.get("label", s5.get("story_label","")).astype(str).map(nkey)
+    s5["label_key"]   = s5.get("label", s5.get("story_label","")).astype(str).map(nkey)  # ← use shared
     m5 = (s5[["period_norm","label_key","cluster_id"]]
           .dropna(subset=["cluster_id"])
           .drop_duplicates(["period_norm","label_key"]))
@@ -570,6 +573,8 @@ def main():
     missing = need - set(df.columns)
     if missing:
         raise RuntimeError(f"[analyze] missing columns in groups: {sorted(missing)}")
+
+    df["label_key"] = df["label"].astype(str).map(nkey)
 
     # build cache key per group
     cache_path = out_dir/"_cache_signatures.parquet"
