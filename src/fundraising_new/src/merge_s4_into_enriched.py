@@ -2,9 +2,13 @@
 import argparse, re
 import pandas as pd
 from pathlib import Path
+import sys
+from pathlib import Path as _P
+# add <repo_root>/src so "fundraising_new" is importable
+sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+from fundraising_new.src.utils.keys import nkey
 
-def nkey(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -19,9 +23,10 @@ def main():
     print(f"[merge_s4_into_enriched] Starting merge with both fundraising and voting contexts...")
 
     # ---------- load enriched (BOTH FUNDRAISING + VOTING) ----------
-    en = pd.read_csv(args.enriched)
+# ---------- load enriched (BOTH FUNDRAISING + VOTING) ----------
+    en = pd.read_csv(args.enriched, low_memory=False)
     print(f"[merge_s4_into_enriched] Loaded enriched: {len(en)} rows, columns: {list(en.columns)}")
-    
+
     en["period_norm"] = pd.to_datetime(en.get("period",""), errors="coerce").dt.date.astype("string")
     lab_en = "story_label" if "story_label" in en.columns else ("label" if "label" in en.columns else None)
     en["label_key"] = en[lab_en].astype(str).apply(nkey) if lab_en else ""
@@ -29,6 +34,7 @@ def main():
         en["cluster_id"] = pd.to_numeric(en["cluster_id"], errors="coerce").astype("Int64")
     else:
         en["cluster_id"] = pd.Series([pd.NA]*len(en), dtype="Int64")
+
 
     # ---------- backfill cluster_id from s5 (period_norm + label_key) ----------
     s5 = pd.read_parquet(args.s5)
@@ -218,24 +224,37 @@ def main():
     out.to_csv(args.out, index=False)
     print(f"[merge_s4_into_enriched] wrote {args.out}")
     print(f"[merge_s4_into_enriched] Final coverage statistics:")
-    
-    # Check fundraising columns
+
+    # FUNDRAISING
     print(f"  --- FUNDRAISING ---")
+    f_present = 0; f_sum = 0.0
     for c in fundraising_cols:
         if c in out.columns:
-            coverage = out[c].notna().mean()
-            print(f"  {c}: {coverage:.3%}")
+            cov = out[c].notna().mean()
+            f_sum += cov; f_present += 1
+            print(f"  {c}: {cov:.3%}")
         else:
             print(f"  {c}: COLUMN MISSING")
-    
-    # Check voting columns  
+    if f_present:
+        print(f"  Fundraising average: {(f_sum/f_present):.1%} across {f_present} columns")
+    else:
+        print(f"  Fundraising average: n/a (0 columns)")
+
+    # VOTING
     print(f"  --- VOTING ---")
+    v_present = 0; v_sum = 0.0
     for c in voting_cols:
         if c in out.columns:
-            coverage = out[c].notna().mean()
-            print(f"  {c}: {coverage:.3%}")
+            cov = out[c].notna().mean()
+            v_sum += cov; v_present += 1
+            print(f"  {c}: {cov:.3%}")
         else:
             print(f"  {c}: COLUMN MISSING")
+    if v_present:
+        print(f"  Voting average: {(v_sum/v_present):.1%} across {v_present} columns")
+    else:
+        print(f"  Voting average: n/a (0 columns)")
+
 
 if __name__ == "__main__":
     main()
