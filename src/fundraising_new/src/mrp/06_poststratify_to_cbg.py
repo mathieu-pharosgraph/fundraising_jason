@@ -58,7 +58,7 @@ raked["state_urban_z"]  = raked["state_urban_z"].fillna(0.0)
 need_cols = [
     "cbg_id", "w_raked",
     "age_bin","sex","race_eth","edu_bin","income_bin","married","owner",
-    "state_income_z","state_urban_z"
+    "state_income_z","state_urban_z","state_postal","state_gop_2p_z"  # add these two
 ]
 missing = [c for c in need_cols if c not in raked.columns]
 if missing:
@@ -102,7 +102,6 @@ b_sinc  = mean_term("state_income_z")  # scalar
 b_surb  = mean_term("state_urban_z")   # scalar
 taus    = mean_term("threshold")    # shape: (6,) for a 7-point scale
 b_gop   = mean_term("state_gop_2p_z")      # scalar
-tau     = mean_term("threshold")           # (6,)
 
 # random intercept pieces
 re_sig  = mean_term("1|state_postal_sigma")                      # scalar
@@ -228,6 +227,7 @@ try:
     cbg_out = cbg_out.merge(ruca, on="cbg_id", how="left")
 except Exception:
     pass
+cbg_out = cbg_out.merge(raked[["cbg_id","state_postal"]].drop_duplicates("cbg_id"), on="cbg_id", how="left")
 
 # -------- Save --------
 OUTF = OUTD / "pid7_shares.parquet"
