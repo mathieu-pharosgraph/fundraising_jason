@@ -89,108 +89,110 @@ def mean_term(name):
     da = post[name].mean(dim=("chain","draw"))
     return da
 
-# Extract posterior means for each term
-# Note: cumulative (ordinal) omits an explicit intercept; thresholds carry cutpoints.
-b_age   = mean_term("age_bin")      # dims: age_bin (levels excluding baseline)
-b_sex   = mean_term("sex")          # dims: sex (levels excluding baseline)
-b_race  = mean_term("race_eth")     # dims: race_eth (levels excluding baseline)
-b_edu   = mean_term("edu_bin")      # dims: edu_bin (levels excluding baseline)
-b_inc   = mean_term("income_bin")   # dims: income_bin (levels excluding baseline)
-b_mar   = mean_term("married")      # scalar (for 'other' vs baseline 'married') or dims if encoded as factor
-b_own   = mean_term("owner")        # scalar (for 'renter' vs baseline 'owner')
-b_sinc  = mean_term("state_income_z")  # scalar
-b_surb  = mean_term("state_urban_z")   # scalar
-taus    = mean_term("threshold")    # shape: (6,) for a 7-point scale
-b_gop   = mean_term("state_gop_2p_z")      # scalar
+# -------- Extract posterior means (fixed) + build eta + add RE --------
 
-# random intercept pieces
+# Posterior means for fixed effects
+b_age   = mean_term("age_bin")         # vector (levels != baseline) or None
+b_sex   = mean_term("sex")
+b_race  = mean_term("race_eth")
+b_edu   = mean_term("edu_bin")
+b_inc   = mean_term("income_bin")
+b_mar   = mean_term("married")         # scalar (other vs married) or None
+b_own   = mean_term("owner")           # scalar (renter vs owner) or None
+b_sinc  = mean_term("state_income_z")  # scalar or None
+b_surb  = mean_term("state_urban_z")   # scalar or None
+b_gop   = mean_term("state_gop_2p_z")  # scalar or None
+taus    = mean_term("threshold")       # (6,)
 
-
-if taus is None or taus.shape[-1] != 6:
+if taus is None or np.asarray(taus).shape[-1] != 6:
     raise ValueError("Expected 'threshold' with length 6 in posterior means (cumulative ordered model).")
 
-# Convert to numpy
 def to_np(x):
     return None if x is None else np.asarray(x)
 
-b_age_np  = to_np(b_age)    # None or (L_age-1,)
+def _to_float_scalar(x, default=0.0):
+    if x is None:
+        return float(default)
+    try:
+        # works for DataArray/np scalar/Python float
+        return float(np.asarray(x).item())
+    except Exception:
+        return float(x)
+
+# Cast scalars ONCE
+b_sinc_f = _to_float_scalar(b_sinc, 0.0)
+b_surb_f = _to_float_scalar(b_surb, 0.0)
+b_gop_f  = _to_float_scalar(b_gop,  0.0)
+
+# Vectors (may be None if factor absent)
+b_age_np  = to_np(b_age)
 b_sex_np  = to_np(b_sex)
 b_race_np = to_np(b_race)
 b_edu_np  = to_np(b_edu)
 b_inc_np  = to_np(b_inc)
-b_mar_np  = to_np(b_mar).reshape(1) if b_mar is not None else None
-b_own_np  = to_np(b_own).reshape(1) if b_own is not None else None
-b_sinc_np = float(b_sinc) if b_sinc is not None else 0.0
-b_surb_np = float(b_surb) if b_surb is not None else 0.0
-taus_np   = to_np(taus)     # (6,)
+b_mar_np  = to_np(b_mar)
+b_own_np  = to_np(b_own)
+taus_np   = to_np(taus)  # (6,)
 
-# Build level index maps for non-baseline coefficients (Bambi stores only non-baseline)
-# For each factor, these are the coefficient names (coords) present in the posterior.
+# Build level-index maps (non-baseline levels only)
 def idx_map(term_name, levels_full):
     da = mean_term(term_name)
-    if da is None or da.ndim == 0:  # scalar / no levels
+    if da is None or da.ndim == 0:
         return {}, []
-    lvl_coord = [d for d in da.dims if d not in ("chain","draw")][0] if hasattr(da, "dims") else list(da.coords)[0]
+    lvl_coord = [d for d in da.dims if d not in ("chain","draw")][0]
     levels_in_beta = list(da.coords[lvl_coord].values)
-    # Build a mapping from full training level -> index in beta (if present), else None (baseline)
-    mapping = {}
-    for L in levels_full:
-        mapping[L] = levels_in_beta.index(L) if L in levels_in_beta else None
+    mapping = {L: (levels_in_beta.index(L) if L in levels_in_beta else None) for L in levels_full}
     return mapping, levels_in_beta
 
-idx_age_map,  _ = idx_map("age_bin",    LEVELS["age_bin"])     # baseline 18-29 -> None
-idx_sex_map,  _ = idx_map("sex",        LEVELS["sex"])         # baseline Female -> None
-idx_race_map, _ = idx_map("race_eth",   LEVELS["race_eth"])    # baseline Asian  -> None
-idx_edu_map,  _ = idx_map("edu_bin",    LEVELS["edu_bin"])     # baseline BAplus -> None
-idx_inc_map,  _ = idx_map("income_bin", LEVELS["income_bin"])  # baseline high   -> None
-# married/owner typically scalar (one non-baseline): handled below
+idx_age_map,  _ = idx_map("age_bin",    LEVELS["age_bin"])
+idx_sex_map,  _ = idx_map("sex",        LEVELS["sex"])
+idx_race_map, _ = idx_map("race_eth",   LEVELS["race_eth"])
+idx_edu_map,  _ = idx_map("edu_bin",    LEVELS["edu_bin"])
+idx_inc_map,  _ = idx_map("income_bin", LEVELS["income_bin"])
 
-# -------- Compute linear predictor (plug-in posterior means) --------
+# Linear predictor
 N = len(raked)
 eta = np.zeros(N, dtype=float)
 
-# Add factor contributions
 def add_factor(eta, series, idx_map, beta_vec):
     if beta_vec is None:
         return eta
     vals = series.astype(str).to_numpy()
-    idxs = np.array([idx_map[v] if v in idx_map else None for v in vals], dtype=object)
+    idxs = np.array([idx_map.get(v, None) for v in vals], dtype=object)
     mask = np.array([i is not None for i in idxs])
     if mask.any():
         eta[mask] += beta_vec[idxs[mask]]
     return eta
 
-eta = add_factor(eta, raked["age_bin"],   idx_age_map,  b_age_np)
-eta = add_factor(eta, raked["sex"],       idx_sex_map,  b_sex_np)
-eta = add_factor(eta, raked["race_eth"],  idx_race_map, b_race_np)
-eta = add_factor(eta, raked["edu_bin"],   idx_edu_map,  b_edu_np)
-eta = add_factor(eta, raked["income_bin"],idx_inc_map,  b_inc_np)
+eta = add_factor(eta, raked["age_bin"],    idx_age_map,  b_age_np)
+eta = add_factor(eta, raked["sex"],        idx_sex_map,  b_sex_np)
+eta = add_factor(eta, raked["race_eth"],   idx_race_map, b_race_np)
+eta = add_factor(eta, raked["edu_bin"],    idx_edu_map,  b_edu_np)
+eta = add_factor(eta, raked["income_bin"], idx_inc_map,  b_inc_np)
 
-# Binary factors (scalar slopes)
+# Binary scalars
 if b_mar_np is not None:
-    eta += b_mar_np[0] * (raked["married"].astype(str).to_numpy() == "other").astype(float)
+    eta += float(np.asarray(b_mar_np).item()) * (raked["married"].astype(str).to_numpy() == "other").astype(float)
 if b_own_np is not None:
-    eta += b_own_np[0] * (raked["owner"].astype(str).to_numpy() == "renter").astype(float)
+    eta += float(np.asarray(b_own_np).item()) * (raked["owner"].astype(str).to_numpy() == "renter").astype(float)
 
-# Numeric covariates
-eta += b_sinc_np * raked["state_income_z"].to_numpy().astype(float)
-eta += b_surb_np * raked["state_urban_z"].to_numpy().astype(float)
-eta += b_gop * raked["state_gop_2p_z"].to_numpy().astype(float)
+# Numeric scalars
+eta += b_sinc_f * raked["state_income_z"].to_numpy(float)
+eta += b_surb_f * raked["state_urban_z"].to_numpy(float)
+eta += b_gop_f  * raked["state_gop_2p_z"].to_numpy(float)
 
 # --- random intercept: (1 | state_postal) ---
 re_sig = mean_term("1|state_postal_sigma")
-re_sig = float(re_sig) if re_sig is not None else 0.0
+re_sig_f = _to_float_scalar(re_sig, 0.0)
 
-re_off = idata_pid.posterior["1|state_postal_offset"]      # dims: chain, draw, <level_dim>
-re_off_mean = re_off.mean(dim=("chain","draw"))            # dims: <level_dim>
+re_off = idata_pid.posterior["1|state_postal_offset"]         # dims: chain, draw, <lvl_dim>
+re_off_mean = re_off.mean(dim=("chain","draw"))               # dims: <lvl_dim>
 
-# discover the level dimension name
-level_dims = [d for d in re_off_mean.dims if d not in ("chain","draw")]
-if not level_dims:
+lvl_dims = [d for d in re_off_mean.dims if d not in ("chain","draw")]
+if not lvl_dims:
     raise RuntimeError("Could not find a level dimension for state random intercept.")
-lvl_dim = level_dims[0]
+lvl_dim = lvl_dims[0]
 
-# build mapping {state_postal_str -> mean_offset}
 def _norm(v):
     try:
         return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
@@ -200,9 +202,10 @@ def _norm(v):
 re_map = {_norm(st): float(re_off_mean.sel({lvl_dim: st}).values)
           for st in list(re_off_mean.coords[lvl_dim].values)}
 
-# add state random intercept: eta += sigma * offset[state]
+# add state RE
 state_vec = raked["state_postal"].astype(str).map(re_map).fillna(0.0).to_numpy()
-eta += re_sig * state_vec
+eta += re_sig_f * state_vec
+
 
 # -------- Compute category probabilities (7 categories) --------
 # Thresholds: tau0=-inf, tau1..tau6=taus_np, tau7=+inf
