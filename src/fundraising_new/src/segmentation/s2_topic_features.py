@@ -3,7 +3,7 @@ import argparse, json, numpy as np, pandas as pd
 from pathlib import Path
 import sys
 from pathlib import Path as _P
-sys.path.append(str(_P(__file__).resolve().parents[3] / "src"))
+sys.path.append(str(_P(__file__).resolve().parents[3]))
 
 from fundraising_new.src.utils.keys import nkey
 
@@ -108,26 +108,48 @@ def main():
 
     # events / items per day (shared between contexts)
     if Path(args.events).exists():
-        ev = pd.read_parquet(args.events).rename(columns={"day":"period"}).copy()
+        ev = pd.read_parquet(args.events).rename(columns={"day": "period"}).copy()
+
+        # 1) normalize the count column name to 'items'
+        count_col = None
+        for cand in ("items", "count", "n_items", "n", "stories", "value"):
+            if cand in ev.columns:
+                count_col = cand
+                break
+        if count_col is None:
+            # no usable count column; treat as empty
+            ev["items"] = pd.NA
+        elif count_col != "items":
+            ev = ev.rename(columns={count_col: "items"})
+
+        # 2) build label_key on the events side
         ev["label_key"] = ev["label"].astype(str).map(nkey)
 
-        # primary: join on (period, label_key)
+        # 3) primary join on (period, label_key)
         X = X.merge(
-            ev[["period","label_key","items"]],
-            on=["period","label_key"], how="left"
+            ev[["period", "label_key", "items"]],
+            on=["period", "label_key"], how="left"
         )
 
-        # fallback: if items still null, try legacy (period, label) join for older files
-        miss = X["items"].isna()
-        if miss.any():
-            X.loc[miss, "items"] = X.loc[miss].merge(
-                ev[["period","label","items"]],
-                on=["period","label"], how="left"
-            )["items"].values
+        # make sure 'items' exists before fallback
+        if "items" not in X.columns:
+            X["items"] = pd.NA
 
-        X = X.rename(columns={"items":"items_per_day"})
+        # 4) fallback: legacy join on (period, label) for older files
+        miss = X["items"].isna()
+        if miss.any() and {"period", "label", "items"} <= set(ev.columns):
+            fb = (
+                X.loc[miss, ["period", "label"]]
+                .merge(ev[["period", "label", "items"]], on=["period", "label"], how="left")
+            )
+            X.loc[miss, "items"] = fb["items"].values
+
+        # 5) finalize
+        X = X.rename(columns={"items": "items_per_day"})
+        X["items_per_day"] = pd.to_numeric(X["items_per_day"], errors="coerce").fillna(0).astype(int)
     else:
         X["items_per_day"] = 0
+
 
 
     # party lean debug (if present) - shared between contexts
