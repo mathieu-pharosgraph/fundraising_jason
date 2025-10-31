@@ -42,6 +42,10 @@ raked = (
     raked.merge(state_inc, on="state_postal", how="left")
          .merge(state_urb, on="state_postal", how="left")
 )
+# bring state two-party GOP z into raked cells
+state_gop = pd.read_parquet("outputs/mrp/state_gop_2p.parquet")[["state_postal","state_gop_2p_z"]]
+raked = raked.merge(state_gop, on="state_postal", how="left")
+raked["state_gop_2p_z"] = raked["state_gop_2p_z"].fillna(0.0)
 
 # fill any holes (should be rare)
 raked["state_income_z"] = raked["state_income_z"].fillna(0.0)
@@ -97,6 +101,20 @@ b_own   = mean_term("owner")        # scalar (for 'renter' vs baseline 'owner')
 b_sinc  = mean_term("state_income_z")  # scalar
 b_surb  = mean_term("state_urban_z")   # scalar
 taus    = mean_term("threshold")    # shape: (6,) for a 7-point scale
+b_gop   = mean_term("state_gop_2p_z")      # scalar
+tau     = mean_term("threshold")           # (6,)
+
+# random intercept pieces
+re_sig  = mean_term("1|state_postal_sigma")                      # scalar
+re_off  = idata_pid.posterior["1|state_postal_offset"]           # dims: chain, draw, state_postal
+re_off_mean = re_off.mean(dim=("chain","draw"))                  # (state_postal,)
+# build dict: state_postal -> mean offset
+re_map = {str(st): float(re_off_mean.sel(state_postal=st).values) for st in re_off_mean["state_postal"].values}
+
+# cast to python scalars
+b_gop = float(b_gop) if b_gop is not None else 0.0
+re_sig = float(re_sig) if re_sig is not None else 0.0
+
 
 if taus is None or taus.shape[-1] != 6:
     raise ValueError("Expected 'threshold' with length 6 in posterior means (cumulative ordered model).")
@@ -167,6 +185,11 @@ if b_own_np is not None:
 # Numeric covariates
 eta += b_sinc_np * raked["state_income_z"].to_numpy().astype(float)
 eta += b_surb_np * raked["state_urban_z"].to_numpy().astype(float)
+eta += b_gop * raked["state_gop_2p_z"].to_numpy().astype(float)
+
+# add state random intercept: eta += sigma * offset[state]
+state_vec = raked["state_postal"].astype(str).map(re_map).fillna(0.0).to_numpy()
+eta += re_sig * state_vec
 
 # -------- Compute category probabilities (7 categories) --------
 # Thresholds: tau0=-inf, tau1..tau6=taus_np, tau7=+inf
