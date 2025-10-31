@@ -221,6 +221,87 @@ probs = np.clip(cdf_hi - cdf_lo, 1e-12, 1.0)          # (7, N)
 probs /= probs.sum(axis=0, keepdims=True)             # normalize columns
 probs = probs.T  # (N, 7) so each row aligns to raked rows
 
+
+# --- Per-state two-party calibration that preserves p4 (independent mass) ---
+
+from scipy.optimize import brentq
+import numpy as np
+import pandas as pd
+from scipy.special import logit, expit
+
+# Load target two-party GOP shares by state (gop_2p in [0,1])
+state_targets = pd.read_parquet("outputs/mrp/state_gop_2p.parquet")[["state_postal","gop_2p"]]
+state_targets = dict(zip(state_targets["state_postal"].astype(str), state_targets["gop_2p"]))
+
+p = probs.copy()                               # (N,7) from your ordered-probit
+w = raked["w_raked"].to_numpy()
+st = raked["state_postal"].astype(str).to_numpy()
+
+# Pre-compute D/R/I and block totals
+D = p[:,0] + p[:,1] + p[:,2]
+I = p[:,3]
+R = p[:,4] + p[:,5] + p[:,6]
+B = D + R                                     # two-party block mass per row
+
+# Avoid division by zero in empty-block rows
+eps = 1e-9
+den = np.clip(B, eps, None)
+q  = np.clip(R / den, 1e-6, 1-1e-6)           # within-block GOP share
+logit_q = np.log(q) - np.log1p(-q)
+
+unique_states = np.unique(st)
+for s in unique_states:
+    T = state_targets.get(s)
+    if T is None:
+        continue  # no target; leave as-is
+    m = (st == s)
+    if not m.any():
+        continue
+    ww   = w[m]
+    Bb   = B[m]
+    qq   = q[m]
+    ll   = logit_q[m]
+    ok   = Bb > 0
+    if not np.any(ok):
+        continue
+
+    # target function: weighted mean of expit(logit(q)+kappa) minus target T
+    def g(k):
+        q_new = expit(ll[ok] + k)
+        return (q_new * Bb[ok] * ww[ok]).sum() / max((Bb[ok] * ww[ok]).sum(), 1e-12) - T
+
+    # bracket and solve for kappa
+    lo, hi = -10.0, 10.0
+    g_lo, g_hi = g(lo), g(hi)
+    if g_lo > 0 and g_hi > 0:
+        k_opt = lo
+    elif g_lo < 0 and g_hi < 0:
+        k_opt = hi
+    else:
+        k_opt = brentq(g, lo, hi, maxiter=100)
+
+    q_new = expit(ll + k_opt)                  # for all rows in s
+    R_new = q_new * Bb
+    D_new = (1.0 - q_new) * Bb
+
+    # scale D and R sub-buckets proportionally, preserve p4 exactly
+    R_old = np.clip(R[m], eps, None)
+    D_old = np.clip(D[m], eps, None)
+    r_scale = (R_new / R_old)[:, None]
+    d_scale = (D_new / D_old)[:, None]
+
+    Pi = p[m].copy()
+    Pi[:, 4:7] = Pi[:, 4:7] * r_scale
+    Pi[:, 0:3] = Pi[:, 0:3] * d_scale
+    # p4 stays as-is; renormalize row-wise for numerical safety
+    row_sum = Pi.sum(axis=1, keepdims=True)
+    Pi = Pi / np.clip(row_sum, eps, None)
+
+    p[m] = Pi
+
+# Replace probs with calibrated values (identity p4 preserved)
+probs = p
+
 # -------- Aggregate to CBG by raked weights --------
 prob_cols = [f"p{k}" for k in range(1,8)]
 for k in range(7):
@@ -244,8 +325,10 @@ try:
     cbg_out = cbg_out.merge(ruca, on="cbg_id", how="left")
 except Exception:
     pass
-cbg_out = cbg_out.merge(raked[["cbg_id","state_postal"]].drop_duplicates("cbg_id"), on="cbg_id", how="left")
-
+cbg_out = cbg_out.merge(
+    raked[["cbg_id","w_raked","state_postal"]].drop_duplicates("cbg_id"),
+    on="cbg_id", how="left"
+)
 # -------- Save --------
 OUTF = OUTD / "pid7_shares.parquet"
 cbg_out.to_parquet(OUTF, index=False)
