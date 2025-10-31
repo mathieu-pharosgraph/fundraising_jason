@@ -104,15 +104,6 @@ taus    = mean_term("threshold")    # shape: (6,) for a 7-point scale
 b_gop   = mean_term("state_gop_2p_z")      # scalar
 
 # random intercept pieces
-re_sig  = mean_term("1|state_postal_sigma")                      # scalar
-re_off  = idata_pid.posterior["1|state_postal_offset"]           # dims: chain, draw, state_postal
-re_off_mean = re_off.mean(dim=("chain","draw"))                  # (state_postal,)
-# build dict: state_postal -> mean offset
-re_map = {str(st): float(re_off_mean.sel(state_postal=st).values) for st in re_off_mean["state_postal"].values}
-
-# cast to python scalars
-b_gop = float(b_gop) if b_gop is not None else 0.0
-re_sig = float(re_sig) if re_sig is not None else 0.0
 
 
 if taus is None or taus.shape[-1] != 6:
@@ -185,6 +176,29 @@ if b_own_np is not None:
 eta += b_sinc_np * raked["state_income_z"].to_numpy().astype(float)
 eta += b_surb_np * raked["state_urban_z"].to_numpy().astype(float)
 eta += b_gop * raked["state_gop_2p_z"].to_numpy().astype(float)
+
+# --- random intercept: (1 | state_postal) ---
+re_sig = mean_term("1|state_postal_sigma")
+re_sig = float(re_sig) if re_sig is not None else 0.0
+
+re_off = idata_pid.posterior["1|state_postal_offset"]      # dims: chain, draw, <level_dim>
+re_off_mean = re_off.mean(dim=("chain","draw"))            # dims: <level_dim>
+
+# discover the level dimension name
+level_dims = [d for d in re_off_mean.dims if d not in ("chain","draw")]
+if not level_dims:
+    raise RuntimeError("Could not find a level dimension for state random intercept.")
+lvl_dim = level_dims[0]
+
+# build mapping {state_postal_str -> mean_offset}
+def _norm(v):
+    try:
+        return v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+    except Exception:
+        return str(v)
+
+re_map = {_norm(st): float(re_off_mean.sel({lvl_dim: st}).values)
+          for st in list(re_off_mean.coords[lvl_dim].values)}
 
 # add state random intercept: eta += sigma * offset[state]
 state_vec = raked["state_postal"].astype(str).map(re_map).fillna(0.0).to_numpy()
