@@ -689,6 +689,14 @@ def main():
         df = df[df["date"] >= pd.to_datetime(args.start).date()]
     if args.end:
         df = df[df["date"] <= pd.to_datetime(args.end).date()]
+    # --- Sanity: enforce the window on actual timestamps, fail fast if outside
+    if df.empty:
+        raise SystemExit("No items after applying date window.")
+
+    mi, ma = df["published_at"].min(), df["published_at"].max()
+    print("items date min/max:", mi, "→", ma, "rows=", len(df))
+    assert str(mi.date()) >= "2025-10-15" and str(ma.date()) <= "2025-10-25", \
+        f"items outside window: {mi}..{ma}"
     df = df.sort_values("published_at").tail(args.max_items).reset_index(drop=True)
 
     print("items date min/max:",
