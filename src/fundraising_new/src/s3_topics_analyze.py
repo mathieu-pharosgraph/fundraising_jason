@@ -521,21 +521,13 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
         }
     v_roles = pd.json_normalize(df["voting_roles"].map(_vroles))
 
-    # assemble
+    # assemble (keep cluster_id straight from metrics to avoid cross-joins)
     spiders = pd.concat([
-        df[["period_norm","label_key"]],
+        df[["period_norm","label_key","cluster_id"]],
         f_emo, f_mf, f_cta, f_roles,
         v_emo, v_mf, v_cta, v_roles
     ], axis=1)
 
-    # --- join S5 to add cluster_id
-    s5 = pd.read_parquet("data/topics/merged_data_with_topics.parquet")
-    s5["period_norm"] = pd.to_datetime(s5.get("period",""), errors="coerce").dt.date.astype("string")
-    s5["label_key"]   = s5.get("label", s5.get("story_label","")).astype(str).map(nkey)  # ← use shared
-    m5 = (s5[["period_norm","label_key","cluster_id"]]
-          .dropna(subset=["cluster_id"])
-          .drop_duplicates(["period_norm","label_key"]))
-    spiders = spiders.merge(m5, on=["period_norm","label_key"], how="left")
 
     # final clean
     num_like = [c for c in spiders.columns if c.endswith("_cta_ask_strength") or
@@ -544,9 +536,25 @@ def _materialize_spiders_from_metrics(metrics_parquet: Path, out_csv: Path):
     for c in num_like:
         spiders[c] = pd.to_numeric(spiders[c], errors="coerce")
 
+    for col in ["fundraising_heroes","fundraising_villains","fundraising_victims","fundraising_antiheroes",
+                "voting_heroes","voting_villains","voting_victims","voting_antiheroes"]:
+        if col in spiders.columns:
+            spiders[col] = spiders[col].map(lambda v: v if (isinstance(v,list) and len(v)>0) else pd.NA)
+
     spiders.to_csv(out_csv, index=False)
     print(f"[spiders] wrote {out_csv} rows={len(spiders)} with cluster_id non-null={spiders['cluster_id'].notna().sum()}")
 
+def roles_len(d):
+    if not isinstance(d, dict): return 0
+    return sum(len(d.get(k,[]) or []) for k in ["heroes","villains","victims","antiheroes"])
+
+def extract_roles_only(snips: str):
+    msgs = [
+        {"role":"system","content":"Extract roles only as strict JSON."},
+        {"role":"user","content": ROLES_ONLY_PROMPT.replace("{snips}", snips)}
+    ]
+    raw = deepseek_chat(msgs, max_tokens=300, temperature=0.0)
+    return normalize_roles(safe_json_load(raw))
 
 # ---------- main ----------
 def main():
@@ -630,6 +638,16 @@ def main():
                 fundraising_cta_norm = _normalize_cta(fundraising_res.get("cta", {}))
                 voting_cta_norm = _normalize_cta(voting_res.get("voting_cta", {}))
                 
+                joined = "\n\n".join(snippets)  # available in this scope
+
+                fr_roles = normalize_roles(fundraising_res.get("roles"))
+                if roles_len(fr_roles) == 0:
+                    fr_roles = extract_roles_only(joined)
+
+                vt_roles = normalize_roles(voting_res.get("roles"))
+                if roles_len(vt_roles) == 0:
+                    vt_roles = extract_roles_only(joined)
+
                 row = {
                     "signature": sig,
                     "cluster_id": int(cid),
@@ -641,7 +659,7 @@ def main():
                     "fundraising_emotions": fundraising_res.get("emotions"),
                     "fundraising_emotions_top": fundraising_res.get("emotions_top"),
                     "fundraising_moral_foundations": fundraising_res.get("moral_foundations"),
-                    "fundraising_roles": normalize_roles(fundraising_res.get("roles")),
+                    "fundraising_roles": fr_roles,
                     "fundraising_hooks": fundraising_res.get("fundraising_hooks"),
                     "fundraising_cta": fundraising_cta_norm,
                     # Voting metrics
@@ -650,7 +668,7 @@ def main():
                     "voting_emotions": voting_res.get("emotions"),
                     "voting_emotions_top": voting_res.get("emotions_top"),
                     "voting_moral_foundations": voting_res.get("moral_foundations"),
-                    "voting_roles": normalize_roles(voting_res.get("roles")),
+                    "voting_roles": vt_roles,
                     "voting_hooks": voting_res.get("voting_hooks"),
                     "voting_cta": voting_cta_norm,
                     "notes": fundraising_res.get("notes"),  # Use fundraising notes
