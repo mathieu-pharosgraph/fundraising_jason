@@ -141,13 +141,24 @@ def main():
                 out.drop(columns=[sc], inplace=True, errors="ignore")
 
         # text fills (treat [], [ ] as blank too)
-        def blank(s):
-            t = s.astype(str).str.strip().str.lower()
-            return t.isin(["", "nan", "none", "—", "[]", "[ ]"])
+        def blank(s: pd.Series) -> pd.Series:
+            """
+            True where s is effectively empty: NaN, '', 'nan', 'none', '—', '-'
+            Expects a Series; caller must ensure column exists.
+            """
+            if not isinstance(s, pd.Series):
+                raise TypeError("blank() expects a pandas Series")
+            t = s.astype("string").str.strip().str.lower()
+            return t.isna() | t.eq("") | t.eq("nan") | t.eq("none") | t.eq("—") | t.eq("-")
+
         for c in targets_txt:
             sc = f"{c}__sp2"
             if sc in out.columns:
-                m = blank(out.get(c, ""))
+                if c not in out.columns:
+                    # initialize with empty strings; same index/length as out
+                    out[c] = ""
+
+                m = blank(out[c])
                 out.loc[m, c] = out.loc[m, sc]
                 out.drop(columns=[sc], inplace=True, errors="ignore")
 
