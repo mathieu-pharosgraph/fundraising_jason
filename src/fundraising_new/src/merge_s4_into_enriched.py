@@ -247,33 +247,25 @@ def main():
     out.to_csv(args.out, index=False)
     print(f"[merge_s4_into_enriched] wrote {args.out}")
     print(f"[merge_s4_into_enriched] Final coverage statistics:")
-    out = en.copy()
+    # ---------- write ----------
+    out.to_csv(args.out, index=False)
+    print(f"[merge_s4_into_enriched] wrote {args.out}")
 
-    # FUNDRAISING
-    print(f"[merge_s4_into_enriched] Merging fundraising data...")
-    out = out.merge(
-        s4_fundraising_pk[["period_norm","cluster_id"] + fundraising_cols]
-            .rename(columns={c: f"{c}__pri" for c in fundraising_cols}),
-        on=["period_norm","cluster_id"], how="left"
-    )
-    out = out.merge(
-        s4_fundraising_lk[["period_norm","label_key"] + fundraising_cols]
-            .rename(columns={c: f"{c}__sec" for c in fundraising_cols}),
-        on=["period_norm","label_key"], how="left"
-    )
+    # ---------- (optional) coverage report ----------
+    print(f"[merge_s4_into_enriched] Final coverage statistics:")
 
-    # VOTING
-    print(f"[merge_s4_into_enriched] Merging voting data...")
-    out = out.merge(
-        s4_voting_pk[["period_norm","cluster_id"] + voting_cols]
-            .rename(columns={c: f"{c}__pri" for c in voting_cols}),
-        on=["period_norm","cluster_id"], how="left"
-    )
-    out = out.merge(
-        s4_voting_lk[["period_norm","label_key"] + voting_cols]
-            .rename(columns={c: f"{c}__sec" for c in voting_cols}),
-        on=["period_norm","label_key"], how="left"
-    )
+    def _pct(col):
+        if col not in out.columns:
+            return "MISSING"
+        return f"{out[col].notna().mean():.1%}"
+
+    print("  --- FUNDRAISING ---")
+    for c in fundraising_cols:
+        print(f"  {c}: {_pct(c)}")
+
+    print("  --- VOTING ---")
+    for c in voting_cols:
+        print(f"  {c}: {_pct(c)}")
 
 
 
